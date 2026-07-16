@@ -23,4 +23,5 @@
 .root-picker-error{margin:13px 0 0!important;padding:10px 12px;border:1px solid #e2b7b7;border-radius:6px;background:#fff7f7;color:#852f2f!important;font-size:12px!important}
 .root-picker-actions{display:grid;grid-template-columns:auto 1fr auto auto}
 .root-picker-actions>span{display:block}
+.folder-button{min-height:34px;padding-inline:14px;box-shadow:0 1px 0 rgba(0,0,0,.08)}
 @media(max-width:760px){.topbar{min-height:54px;padding:7px 14px}.dashboard-content{padding-top:20px}.hero{min-height:118px;padding-bottom:22px}.hero h1{font-size:39px}.topbar-tools{gap:4px}.refresh-button{padding-inline:9px}.root-picker-actions{display:flex;flex-wrap:wrap}.root-picker-actions>span{display:none}.root-picker-actions .button:first-child{margin-right:auto}}
