@@ -30,10 +30,10 @@ test("server-renders the Project Deck dashboard shell", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>Project Deck<\/title>/i);
-  assert.match(html, /Your projects,/);
-  assert.match(html, /LOCAL SYSTEMS/);
-  assert.match(html, /Search name, path, summary, or technology/);
-  assert.match(html, /PROJECT INDEX/);
+  assert.match(html, /Projects on this computer/);
+  assert.match(html, /LOCAL WORKING SET/);
+  assert.match(html, /Search name, description, source, path, technology, or state/);
+  assert.match(html, /PROJECT LEDGER/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 

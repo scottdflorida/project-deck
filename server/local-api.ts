@@ -13,6 +13,7 @@ import {
   scanProjects,
   scanProjectsQuick,
   setProjectsRoot,
+  setProjectPreferences,
   startGithubAuthentication,
 } from "./project-scanner";
 
@@ -106,7 +107,7 @@ async function readBody(request: IncomingMessage) {
 
 function routeParts(url: URL) {
   const match = url.pathname.match(
-    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|push)$/u,
+    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|push|preferences)$/u,
   );
   if (!match) return null;
   try {
@@ -193,6 +194,15 @@ const server = createServer(async (request, response) => {
             typeof body.message === "string" ? body.message : "",
           );
           break;
+        case "preferences":
+          result = await setProjectPreferences(route.name, {
+            ignored: typeof body.ignored === "boolean" ? body.ignored : undefined,
+            localOnly: typeof body.localOnly === "boolean" ? body.localOnly : undefined,
+            description: body.description === null || typeof body.description === "string"
+              ? body.description
+              : undefined,
+          });
+          break;
         default:
           throw new ProjectActionError("Unknown action.", 404);
       }
@@ -207,7 +217,13 @@ const server = createServer(async (request, response) => {
     const actionError = error instanceof ProjectActionError ? error : null;
     const message = actionError?.message || "The local project service hit an unexpected error.";
     if (!actionError) console.error(error);
-    sendJson(response, actionError?.status || 500, { ok: false, error: message });
+    if (actionError?.project) invalidateScanCaches();
+    sendJson(response, actionError?.status || 500, {
+      ok: false,
+      error: message,
+      ...(actionError?.code ? { code: actionError.code } : {}),
+      ...(actionError?.project ? { project: actionError.project } : {}),
+    });
   }
 });
 

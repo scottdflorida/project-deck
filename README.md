@@ -7,12 +7,29 @@ actions in one place.
 
 ## What it shows
 
-- Project summaries from `package.json`, `pyproject.toml`, `Cargo.toml`, or a README
+- Descriptions from README/ABOUT/OVERVIEW files or project manifests, with the
+  exact source shown beside each description
 - Total on-disk size for every project
 - Git status, current branch, recent activity, and working-tree changes
 - Exact-name GitHub matches and linked `origin` repositories
 - Ahead, behind, diverged, unpublished, and in-sync states
-- Search, health filters, and responsive project cards
+- Sorting by name, size, Git, GitHub, or sync state in either direction
+- Working set, needs-attention, local-only, and ignored views
+- Search and a responsive project ledger
+
+If no useful local description is found, Project Deck says so rather than
+inventing one. You can add a private local description from the project's menu.
+Local descriptions are saved in Project Deck's settings and never edit project
+files.
+
+**Copy folder path** copies that project's canonical absolute path. It is kept
+next to the visible path rather than presented as an unexplained project action.
+
+Projects marked **Ignored** are hidden from normal views but remain available in
+the Ignored view and can be restored. Projects marked **Local only** keep their
+local Git information while suppressing GitHub publishing prompts and
+remote-derived attention. Neither preference changes project files, Git remotes,
+or GitHub repositories.
 
 ## Available actions
 

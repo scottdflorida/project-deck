@@ -17,7 +17,7 @@ export const metadata: Metadata = {
     default: "Project Deck",
     template: "%s · Project Deck",
   },
-  description: "A local control center for Git and GitHub projects in Documents.",
+  description: "A local working-set register for projects, Git, and optional GitHub state.",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

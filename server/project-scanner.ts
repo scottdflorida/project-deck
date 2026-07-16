@@ -1,11 +1,12 @@
 import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, lstat, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, lstat, open, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
   GithubRepository,
+  ProjectDescription,
   ProjectRecord,
   ProjectScanResponse,
   SyncState,
@@ -14,7 +15,6 @@ import type {
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_ROOT = path.join(homedir(), "Documents");
-const SETTINGS_PATH = path.join(process.cwd(), ".git-scan-settings.json");
 const COMMAND_TIMEOUT_MS = 1_500;
 const MAX_SUMMARY_LENGTH = 180;
 const GITHUB_CACHE_MS = 60_000;
@@ -22,6 +22,28 @@ const SIZE_ERROR: ProjectSize = {
   status: "error",
   code: "measurement_failed",
   message: "Size unavailable because part of this folder could not be read.",
+};
+
+type StoredProjectPreference = {
+  ignored?: boolean;
+  localOnly?: boolean;
+  description?: string;
+};
+
+type StoredSettings = {
+  version: 1;
+  root: string;
+  projects: Record<string, StoredProjectPreference>;
+};
+
+function settingsPath() {
+  return process.env.GIT_SCAN_SETTINGS_PATH || path.join(process.cwd(), ".git-scan-settings.json");
+}
+
+let settings: StoredSettings = {
+  version: 1,
+  root: path.resolve(process.env.GIT_SCAN_ROOT || DEFAULT_ROOT),
+  projects: {},
 };
 
 type SizeFs = Pick<typeof import("node:fs/promises"), "readdir" | "lstat">;
@@ -85,11 +107,15 @@ let githubLoginInFlight: Promise<{ code: string; verificationUrl: string }> | nu
 
 export class ProjectActionError extends Error {
   status: number;
+  code: string | null;
+  project: ProjectRecord | null;
 
-  constructor(message: string, status = 400) {
+  constructor(message: string, status = 400, details: { code?: string; project?: ProjectRecord } = {}) {
     super(message);
     this.name = "ProjectActionError";
     this.status = status;
+    this.code = details.code || null;
+    this.project = details.project || null;
   }
 }
 
@@ -159,8 +185,17 @@ function expandHome(value: string) {
   return trimmed;
 }
 
-async function validateProjectsRoot(value: string) {
+export async function canonicalizeProjectPath(value: string) {
   const resolved = path.resolve(expandHome(value));
+  try {
+    return await realpath(resolved);
+  } catch {
+    return resolved === path.parse(resolved).root ? resolved : resolved.replace(/[\\/]+$/u, "");
+  }
+}
+
+async function validateProjectsRoot(value: string) {
+  const resolved = await canonicalizeProjectPath(value);
   let rootStat;
   try {
     rootStat = await stat(resolved);
@@ -174,11 +209,18 @@ async function validateProjectsRoot(value: string) {
 }
 
 export async function loadProjectsRoot() {
-  if (process.env.GIT_SCAN_ROOT) return selectedProjectsRoot;
+  if (process.env.GIT_SCAN_ROOT) selectedProjectsRoot = await validateProjectsRoot(process.env.GIT_SCAN_ROOT);
+  settings = { version: 1, root: selectedProjectsRoot, projects: {} };
   try {
-    const saved = JSON.parse(await readFile(SETTINGS_PATH, "utf8")) as { root?: unknown };
-    if (typeof saved.root === "string") {
-      selectedProjectsRoot = await validateProjectsRoot(saved.root);
+    const saved = JSON.parse(await readFile(settingsPath(), "utf8")) as Partial<StoredSettings>;
+    if (saved.version === 1) {
+      if (!process.env.GIT_SCAN_ROOT && typeof saved.root === "string") {
+        selectedProjectsRoot = await validateProjectsRoot(saved.root);
+      }
+      const projects = saved.projects && typeof saved.projects === "object" && !Array.isArray(saved.projects)
+        ? Object.fromEntries(Object.entries(saved.projects).filter(([, value]) => value && typeof value === "object" && !Array.isArray(value)))
+        : {};
+      settings = { version: 1, root: selectedProjectsRoot, projects };
     }
   } catch {
     // Missing, stale, or malformed local preferences fall back to ~/Documents.
@@ -188,12 +230,33 @@ export async function loadProjectsRoot() {
 
 export async function setProjectsRoot(value: string) {
   selectedProjectsRoot = await validateProjectsRoot(value);
-  await writeFile(
-    SETTINGS_PATH,
-    `${JSON.stringify({ root: selectedProjectsRoot }, null, 2)}\n`,
-    { mode: 0o600 },
-  );
+  settings = { ...settings, root: selectedProjectsRoot };
+  await persistSettings();
   return selectedProjectsRoot;
+}
+
+async function persistSettings() {
+  await writeFile(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+}
+
+function preferenceFor(canonicalPath: string) {
+  const stored = settings.projects[canonicalPath] || {};
+  return {
+    ignored: stored.ignored === true,
+    localOnly: stored.localOnly === true,
+    description: typeof stored.description === "string" && stored.description.trim()
+      ? stored.description.trim()
+      : null,
+  };
+}
+
+function assertGithubActionAllowed(name: string, canonicalPath: string, action: string) {
+  if (!preferenceFor(canonicalPath).localOnly) return;
+  throw new ProjectActionError(
+    `${name} is marked Local only. Choose Allow GitHub before ${action}. No repository action was run.`,
+    409,
+    { code: "local_only" },
+  );
 }
 
 export async function chooseProjectsRoot() {
@@ -334,100 +397,147 @@ function friendlyCommandError(result: CommandResult, fallback: string) {
   return lastLine || fallback;
 }
 
-function cleanMarkdown(value: string) {
+export function cleanDescription(value: string) {
   return value
     .replace(/^---[\s\S]*?---\s*/u, "")
     .replace(/<!--([\s\S]*?)-->/gu, " ")
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/gu, " ")
     .replace(/!\[[^\]]*\]\([^)]*\)/gu, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
     .replace(/<[^>]+>/gu, " ")
-    .replace(/[`*_~>#|]/gu, " ")
+    .replace(/[`*_~>#]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
 }
 
-function truncate(value: string, maxLength = MAX_SUMMARY_LENGTH) {
-  if (value.length <= maxLength) return value;
-  const candidate = value.slice(0, maxLength - 1);
-  const lastSpace = candidate.lastIndexOf(" ");
-  return `${candidate.slice(0, Math.max(lastSpace, maxLength - 24))}…`;
+export function compactDescription(value: string, maxLength = MAX_SUMMARY_LENGTH) {
+  const points = Array.from(value);
+  return points.length <= maxLength ? value : `${points.slice(0, maxLength - 1).join("")}…`;
 }
 
-function summaryFromReadme(contents: string) {
-  const withoutFrontmatter = contents.replace(/^---[\s\S]*?---\s*/u, "");
-  const paragraphs = withoutFrontmatter.split(/\n\s*\n/u);
+function acceptedDescription(value: string) {
+  const cleaned = cleanDescription(value);
+  const words = cleaned.match(/[\p{L}\p{N}]+/gu) || [];
+  return Array.from(cleaned).length >= 24 && words.length >= 4 ? cleaned : null;
+}
+
+export function descriptionFromOverview(contents: string) {
+  const withoutNoise = contents
+    .replace(/^---[\s\S]*?---\s*/u, "")
+    .replace(/<!--([\s\S]*?)-->/gu, " ")
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/gu, " ");
+  const paragraphs = withoutNoise.split(/\n\s*\n/u);
 
   for (const paragraph of paragraphs) {
-    const lines = paragraph
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(
-        (line) =>
-          line &&
-          !line.startsWith("#") &&
-          !line.startsWith("[") &&
-          !line.startsWith("!") &&
-          !line.startsWith("<") &&
-          !/^[-|: ]+$/u.test(line),
-      );
-    const cleaned = cleanMarkdown(lines.join(" "));
-    if (cleaned.length >= 24) return truncate(cleaned);
+    const lines = paragraph.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    if (lines.every((line) =>
+      /^#{1,6}\s|^!\[|^\[[^\]]*\](?:\([^)]*\))?$|^[-*+]\s*$|^\|.*\|$|^\s*[-:| ]+\s*$/u.test(line)
+    )) continue;
+    const accepted = acceptedDescription(lines.join(" "));
+    if (accepted) return accepted;
   }
 
   return null;
 }
 
-async function readProjectDescription(projectPath: string, names: string[]) {
-  const packageFile = names.find((name) => name.toLowerCase() === "package.json");
+function winningName(names: string[], slot: string) {
+  if (names.includes(slot)) return slot;
+  return names.filter((name) => name.toLowerCase() === slot.toLowerCase()).sort()[0] || null;
+}
+
+async function readPrefix(filePath: string, bytes = 64 * 1024) {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function fileDescription(text: string, file: string): ProjectDescription {
+  return {
+    text,
+    compact: compactDescription(text),
+    source: "file",
+    sourceLabel: `From ${file}`,
+    sourceFile: file,
+  };
+}
+
+function tomlDescription(contents: string, section: string) {
+  let active = false;
+  for (const line of contents.split(/\r?\n/u)) {
+    const heading = line.match(/^\s*\[([^\]]+)\]\s*$/u)?.[1];
+    if (heading) {
+      if (active) return null;
+      active = heading === section;
+      continue;
+    }
+    if (!active) continue;
+    const description = line.match(/^\s*description\s*=\s*["'](.+?)["']\s*$/u)?.[1];
+    if (description) return description;
+  }
+  return null;
+}
+
+export async function discoverProjectDescription(projectPath: string, names: string[], localOverride: string | null = null): Promise<ProjectDescription> {
+  if (localOverride) {
+    const text = cleanDescription(localOverride);
+    if (text) return { text, compact: compactDescription(text), source: "local", sourceLabel: "Edited in Project Deck", sourceFile: null };
+  }
+
+  for (const slot of ["README.md", "README", "README.rst", "README.txt", "ABOUT.md", "OVERVIEW.md"]) {
+    const file = winningName(names, slot);
+    if (!file) continue;
+    try {
+      const description = descriptionFromOverview(await readPrefix(path.join(projectPath, file)));
+      if (description) return fileDescription(description, file);
+    } catch {
+      // Deterministically fall through to the next source.
+    }
+  }
+
+  const packageFile = winningName(names, "package.json");
   if (packageFile) {
     try {
       const packageJson = JSON.parse(
         await readFile(path.join(projectPath, packageFile), "utf8"),
       ) as { description?: unknown };
-      if (typeof packageJson.description === "string" && packageJson.description.trim()) {
-        return truncate(cleanMarkdown(packageJson.description));
-      }
+      const description = typeof packageJson.description === "string" ? acceptedDescription(packageJson.description) : null;
+      if (description) return fileDescription(description, packageFile);
     } catch {
       // Fall through to other project metadata.
     }
   }
 
-  const pyproject = names.find((name) => name.toLowerCase() === "pyproject.toml");
+  const pyproject = winningName(names, "pyproject.toml");
   if (pyproject) {
     try {
       const contents = await readFile(path.join(projectPath, pyproject), "utf8");
-      const description = contents.match(/^description\s*=\s*["'](.+?)["']\s*$/mu)?.[1];
-      if (description) return truncate(cleanMarkdown(description));
+      for (const section of ["project", "tool.poetry"]) {
+        const description = acceptedDescription(tomlDescription(contents, section) || "");
+        if (description) return fileDescription(description, pyproject);
+      }
     } catch {
-      // Fall through to README content.
+      // Fall through to Cargo metadata.
     }
   }
 
-  const cargoFile = names.find((name) => name.toLowerCase() === "cargo.toml");
+  const cargoFile = winningName(names, "Cargo.toml");
   if (cargoFile) {
     try {
       const contents = await readFile(path.join(projectPath, cargoFile), "utf8");
-      const description = contents.match(/^description\s*=\s*["'](.+?)["']\s*$/mu)?.[1];
-      if (description) return truncate(cleanMarkdown(description));
-    } catch {
-      // Fall through to README content.
-    }
-  }
-
-  const readme = names.find((name) => /^readme(?:\.[^.]+)?$/iu.test(name));
-  if (readme) {
-    try {
-      const contents = await readFile(path.join(projectPath, readme), {
-        encoding: "utf8",
-      });
-      const summary = summaryFromReadme(contents.slice(0, 64 * 1024));
-      if (summary) return summary;
+      const description = acceptedDescription(tomlDescription(contents, "package") || "");
+      if (description) return fileDescription(description, cargoFile);
     } catch {
       // A missing description is a valid project state.
     }
   }
 
-  return "No project description found yet.";
+  return { text: "", compact: "", source: "none", sourceLabel: "No suitable local description found", sourceFile: null };
 }
 
 function detectTechnologies(names: string[]) {
@@ -675,13 +785,15 @@ async function scanProject(
   refreshRemote: boolean,
 ): Promise<ProjectRecord> {
   const projectPath = path.join(root, name);
+  const canonicalPath = await canonicalizeProjectPath(projectPath);
   const [entries, projectStat, size] = await Promise.all([
     readdir(projectPath, { withFileTypes: true }).catch(() => []),
     stat(projectPath),
     measureProjectSizeForScan(projectPath, root),
   ]);
   const names = entries.map((entry) => entry.name);
-  const summary = await readProjectDescription(projectPath, names);
+  const projectPreference = preferenceFor(canonicalPath);
+  const description = await discoverProjectDescription(projectPath, names, projectPreference.description);
   const technologies = detectTechnologies(names);
   const isRepository = await exists(path.join(projectPath, ".git"));
 
@@ -689,8 +801,11 @@ async function scanProject(
     const matchedRepository = github.byName.get(name.toLowerCase()) || null;
     return {
       name,
+      canonicalPath,
       pathLabel: `${rootLabel(root)}/${name}`,
-      summary,
+      description,
+      summary: description.compact,
+      preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies,
       modifiedAt: projectStat.mtime.toISOString(),
       size,
@@ -766,8 +881,11 @@ async function scanProject(
 
   return {
     name,
+    canonicalPath,
     pathLabel: `${rootLabel(root)}/${name}`,
-    summary,
+    description,
+    summary: description.compact,
+    preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
     technologies,
     modifiedAt: projectStat.mtime.toISOString(),
     size,
@@ -828,6 +946,7 @@ export async function scanProjects(refreshRemote = false): Promise<ProjectScanRe
   );
 
   return {
+    rootPath: root,
     rootLabel: rootLabel(root),
     scannedAt: new Date().toISOString(),
     github: {
@@ -854,14 +973,21 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
   if (!includeSizes) {
     const now = new Date().toISOString();
     return {
+      rootPath: root,
       rootLabel: rootLabel(root),
       scannedAt: now,
       enriching: true,
       github: { available: false, login: null },
-      projects: folderNames.map((name) => ({
-        name,
+      projects: folderNames.map((name) => {
+        const canonicalPath = path.join(root, name);
+        const projectPreference = preferenceFor(canonicalPath);
+        const description: ProjectDescription = { text: "", compact: "", source: "checking", sourceLabel: "Checking local description…", sourceFile: null };
+        return ({
+        name, canonicalPath,
         pathLabel: `${rootLabel(root)}/${name}`,
-        summary: "Project details are being checked in the background.",
+        description,
+        summary: "",
+        preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
         technologies: [],
         modifiedAt: now,
         size: { ...SIZE_ERROR },
@@ -882,7 +1008,8 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
           checkedRemote: false,
           detail: "Git and GitHub status are still being checked in the background.",
         },
-      })),
+        transient: { size: "checking", git: "checking", github: "checking", sync: "checking" },
+      });}),
     };
   }
 
@@ -892,6 +1019,7 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
   ]);
   const projects = await mapWithConcurrency(folderNames, 32, async (name) => {
     const projectPath = path.join(root, name);
+    const canonicalPath = await canonicalizeProjectPath(projectPath);
     const [projectEntries, projectStat, isRepository] = await Promise.all([
       readdir(projectPath, { withFileTypes: true }).catch(() => []),
       stat(projectPath),
@@ -924,11 +1052,16 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
       }
     }
     const matchedRepository = github.byName.get(name.toLowerCase()) || null;
+    const projectPreference = preferenceFor(canonicalPath);
+    const description = await discoverProjectDescription(projectPath, names, projectPreference.description);
 
     return {
       name,
+      canonicalPath,
       pathLabel: `${rootLabel(root)}/${name}`,
-      summary: await readProjectDescription(projectPath, names),
+      description,
+      summary: description.compact,
+      preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies: detectTechnologies(names),
       modifiedAt: projectStat.mtime.toISOString(),
       size: projectSizes.get(name) || { ...SIZE_ERROR },
@@ -954,10 +1087,14 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
           ? "The GitHub remote is linked; commit and sync details are still being checked."
           : "No GitHub remote is linked.",
       },
+      transient: isRepository
+        ? { git: "checking" as const, ...(linkedRepository ? { sync: "checking" as const } : {}) }
+        : undefined,
     } satisfies ProjectRecord;
   });
 
   return {
+    rootPath: root,
     rootLabel: rootLabel(root),
     scannedAt: new Date().toISOString(),
     enriching: true,
@@ -984,7 +1121,41 @@ async function resolveProject(name: string) {
     throw new ProjectActionError("Actions are only available for direct project folders.", 400);
   }
 
-  return { root, projectPath };
+  return { root, projectPath, canonicalPath: await canonicalizeProjectPath(projectPath) };
+}
+
+export async function setProjectPreferences(
+  name: string,
+  patch: { ignored?: boolean; localOnly?: boolean; description?: string | null },
+) {
+  const { canonicalPath } = await resolveProject(name);
+  const current = settings.projects[canonicalPath] || {};
+  const next: StoredProjectPreference = { ...current };
+  if (typeof patch.ignored === "boolean") next.ignored = patch.ignored;
+  if (typeof patch.localOnly === "boolean") next.localOnly = patch.localOnly;
+  if (patch.description === null) delete next.description;
+  else if (typeof patch.description === "string") {
+    const cleaned = cleanDescription(patch.description).slice(0, 2_000).trim();
+    if (!cleaned) delete next.description;
+    else next.description = cleaned;
+  }
+  if (!next.ignored && !next.localOnly && !next.description) delete settings.projects[canonicalPath];
+  else settings.projects[canonicalPath] = next;
+  await persistSettings();
+  return {
+    message: patch.ignored === true
+      ? `${name} moved to Ignored.`
+      : patch.ignored === false
+        ? `${name} restored to the working set.`
+        : patch.localOnly === true
+          ? `${name} will stay local only.`
+          : patch.localOnly === false
+            ? `GitHub publishing is allowed for ${name}.`
+            : patch.description === null
+              ? `Local description cleared for ${name}.`
+              : `Local description saved for ${name}.`,
+    project: await refreshedProject(name),
+  };
 }
 
 async function ensureGitRepository(projectPath: string) {
@@ -1014,7 +1185,8 @@ export async function initializeProject(name: string) {
 }
 
 export async function linkMatchedRepository(name: string) {
-  const { root, projectPath } = await resolveProject(name);
+  const { root, projectPath, canonicalPath } = await resolveProject(name);
+  assertGithubActionAllowed(name, canonicalPath, "linking a repository");
   const github = await getGithubContext(root);
   if (!github.available) {
     throw new ProjectActionError("Sign in with GitHub CLI before linking repositories.", 409);
@@ -1024,7 +1196,7 @@ export async function linkMatchedRepository(name: string) {
     throw new ProjectActionError("No exact-name GitHub repository was found for this folder.", 404);
   }
 
-  await ensureGitRepository(projectPath);
+  const initialized = await ensureGitRepository(projectPath);
   const existingOrigin = await run("git", ["remote", "get-url", "origin"], projectPath);
   if (existingOrigin.ok) {
     throw new ProjectActionError("This repository already has an origin remote.", 409);
@@ -1038,12 +1210,18 @@ export async function linkMatchedRepository(name: string) {
   );
   if (!linked.ok) {
     throw new ProjectActionError(
-      friendlyCommandError(linked, "The GitHub repository could not be linked."),
+      initialized
+        ? `Git initialized locally, but ${repository.nameWithOwner} could not be added as origin. The local .git folder remains; no files or commits were changed.`
+        : friendlyCommandError(linked, "The GitHub repository could not be linked."),
+      409,
+      { code: initialized ? "initialized_link_failed" : "link_failed", project: await refreshedProject(name) },
     );
   }
 
   return {
-    message: `Linked ${repository.nameWithOwner} as origin.`,
+    message: initialized
+      ? `Git initialized locally and ${repository.nameWithOwner} linked as origin.`
+      : `Linked ${repository.nameWithOwner} as origin.`,
     project: await refreshedProject(name),
   };
 }
@@ -1062,13 +1240,14 @@ export async function createGithubRepository(
   name: string,
   visibility: "private" | "public",
 ) {
-  const { root, projectPath } = await resolveProject(name);
+  const { root, projectPath, canonicalPath } = await resolveProject(name);
+  assertGithubActionAllowed(name, canonicalPath, "creating a GitHub repository");
   const github = await getGithubContext(root);
   if (!github.available) {
     throw new ProjectActionError("Sign in with GitHub CLI before creating a repository.", 409);
   }
 
-  await ensureGitRepository(projectPath);
+  const initialized = await ensureGitRepository(projectPath);
   const existingOrigin = await run("git", ["remote", "get-url", "origin"], projectPath);
   if (existingOrigin.ok) {
     throw new ProjectActionError("This project already has an origin remote.", 409);
@@ -1095,14 +1274,31 @@ export async function createGithubRepository(
     30_000,
   );
   if (!created.ok) {
+    const originAfterFailure = await run("git", ["remote", "get-url", "origin"], projectPath);
+    const project = await refreshedProject(name);
+    if (originAfterFailure.ok) {
+      throw new ProjectActionError(
+        `GitHub repository setup did not finish, but origin now exists for ${name}. Local Git and the remote remain unchanged from that partial result; no commit or push was run.`,
+        409,
+        { code: "create_remote_partial", project },
+      );
+    }
+    if (initialized) {
+      throw new ProjectActionError(
+        `Git initialized locally for ${name}, but GitHub repository creation failed. The local .git folder remains; no commit or push was run.`,
+        409,
+        { code: "create_after_init_failed", project },
+      );
+    }
     throw new ProjectActionError(
       friendlyCommandError(created, "GitHub could not create the repository."),
       409,
+      { code: "create_failed", project },
     );
   }
 
   return {
-    message: `Created ${github.login}/${repositoryName} as a ${visibility} repository.`,
+    message: `${initialized ? "Initialized local Git, created" : "Created"} ${github.login}/${repositoryName} as a ${visibility} repository, and added origin. No commit or push was run.`,
     project: await refreshedProject(name),
   };
 }
@@ -1118,24 +1314,32 @@ function looksSensitive(fileName: string) {
   );
 }
 
-export async function commitAndPushProject(name: string, requestedMessage: string) {
-  const { projectPath } = await resolveProject(name);
+type CommitPushOptions = {
+  execute?: typeof run;
+  refresh?: (name: string) => Promise<ProjectRecord>;
+};
+
+export async function commitAndPushProject(name: string, requestedMessage: string, options: CommitPushOptions = {}) {
+  const { projectPath, canonicalPath } = await resolveProject(name);
+  assertGithubActionAllowed(name, canonicalPath, "publishing to GitHub");
+  const execute = options.execute || run;
+  const refresh = options.refresh || refreshedProject;
   if (!(await exists(path.join(projectPath, ".git")))) {
     throw new ProjectActionError("Initialize Git before pushing this project.", 409);
   }
 
-  const origin = await run("git", ["remote", "get-url", "origin"], projectPath);
+  const origin = await execute("git", ["remote", "get-url", "origin"], projectPath);
   if (!origin.ok || !parseGithubRemote(origin.stdout)) {
     throw new ProjectActionError("Link a GitHub repository before pushing.", 409);
   }
 
-  const branchResult = await run("git", ["branch", "--show-current"], projectPath);
+  const branchResult = await execute("git", ["branch", "--show-current"], projectPath);
   const branch = branchResult.stdout;
   if (!branch) {
     throw new ProjectActionError("Choose a branch before pushing this repository.", 409);
   }
 
-  const untracked = await run(
+  const untracked = await execute(
     "git",
     ["ls-files", "--others", "--exclude-standard"],
     projectPath,
@@ -1149,14 +1353,14 @@ export async function commitAndPushProject(name: string, requestedMessage: strin
     );
   }
 
-  await run("git", ["fetch", "--quiet", "--prune", "origin"], projectPath, 12_000);
-  const remoteBranch = await run(
+  await execute("git", ["fetch", "--quiet", "--prune", "origin"], projectPath, 12_000);
+  const remoteBranch = await execute(
     "git",
     ["show-ref", "--verify", `refs/remotes/origin/${branch}`],
     projectPath,
   );
   if (remoteBranch.ok) {
-    const comparison = await run(
+    const comparison = await execute(
       "git",
       ["rev-list", "--left-right", "--count", `origin/${branch}...HEAD`],
       projectPath,
@@ -1174,24 +1378,30 @@ export async function commitAndPushProject(name: string, requestedMessage: strin
     }
   }
 
-  const status = await run("git", ["status", "--porcelain"], projectPath, 15_000);
+  const status = await execute("git", ["status", "--porcelain"], projectPath, 15_000);
   if (!status.ok) {
     throw new ProjectActionError(
       friendlyCommandError(status, "The working tree could not be checked before pushing."),
       409,
     );
   }
+  const hasHeadBefore = await execute("git", ["rev-parse", "HEAD"], projectPath);
+  const requiresMessage = Boolean(status.stdout) || !hasHeadBefore.ok;
+  const message = requestedMessage.trim().slice(0, 120);
+  if (requiresMessage && !message) {
+    throw new ProjectActionError("Enter a commit message before creating the commit. No files were staged and no push was attempted.", 400, { code: "commit_message_required" });
+  }
   let committed = false;
+  let emptyInitialCommit = false;
   if (status.stdout) {
-    const staged = await run("git", ["add", "-A"], projectPath, 30_000);
+    const staged = await execute("git", ["add", "-A"], projectPath, 30_000);
     if (!staged.ok) {
       throw new ProjectActionError(
         friendlyCommandError(staged, "Local changes could not be staged."),
       );
     }
 
-    const message = requestedMessage.trim().slice(0, 120) || "Update from Project Deck";
-    const committedResult = await run(
+    const committedResult = await execute(
       "git",
       ["commit", "-m", message],
       projectPath,
@@ -1206,10 +1416,9 @@ export async function commitAndPushProject(name: string, requestedMessage: strin
     committed = true;
   }
 
-  const hasHead = await run("git", ["rev-parse", "HEAD"], projectPath);
+  const hasHead = committed ? { ok: true } : hasHeadBefore;
   if (!hasHead.ok) {
-    const message = requestedMessage.trim().slice(0, 120) || "Initial commit from Project Deck";
-    const emptyCommit = await run(
+    const emptyCommit = await execute(
       "git",
       ["commit", "--allow-empty", "-m", message],
       projectPath,
@@ -1222,18 +1431,40 @@ export async function commitAndPushProject(name: string, requestedMessage: strin
       );
     }
     committed = true;
+    emptyInitialCommit = true;
   }
 
-  const pushed = await run("git", ["push", "-u", "origin", branch], projectPath, 30_000);
+  const pushed = await execute("git", ["push", "-u", "origin", branch], projectPath, 30_000);
   if (!pushed.ok) {
+    if (!hasHeadBefore.ok && committed) {
+      throw new ProjectActionError(
+        `Initial commit created locally, but push failed. ${friendlyCommandError(pushed, "Retry Push to GitHub when the remote is available.")}`,
+        409,
+        { code: emptyInitialCommit ? "empty_initial_push_failed" : "initial_push_failed", project: await refresh(name) },
+      );
+    }
+    if (committed) {
+      throw new ProjectActionError(
+        `Commit created locally, but push failed. ${friendlyCommandError(pushed, "Retry Push to GitHub when the remote is available.")}`,
+        409,
+        { code: "commit_push_failed", project: await refresh(name) },
+      );
+    }
     throw new ProjectActionError(
       friendlyCommandError(pushed, "The project could not be pushed to GitHub."),
       409,
+      { code: "push_failed", project: await refresh(name) },
     );
   }
 
   return {
-    message: committed ? "Committed local changes and pushed them to GitHub." : "Pushed local commits to GitHub.",
-    project: await refreshedProject(name),
+    message: !hasHeadBefore.ok
+      ? emptyInitialCommit
+        ? "Empty initial commit created and pushed to GitHub."
+        : "Initial commit created and pushed to GitHub."
+      : committed
+        ? "Committed local changes and pushed them to GitHub."
+        : "Pushed local commits to GitHub.",
+    project: await refresh(name),
   };
 }

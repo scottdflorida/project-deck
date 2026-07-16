@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { initializeProject, scanProjects } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, setProjectPreferences } from "../server/project-scanner";
+import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
 
@@ -143,4 +144,197 @@ test("formats byte boundaries without unstable units", () => {
   assert.equal(formatProjectSize(Number.NaN), "Unavailable");
   assert.equal(formatProjectSize(Number.POSITIVE_INFINITY), "Unavailable");
   assert.equal(formatProjectSize(-1), "Unavailable");
+});
+
+test("discovers overview prose before manifests and reports exact provenance", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-description-test-"));
+  try {
+    await writeFile(path.join(root, "README.md"), "---\ntitle: ignored\n---\n\n# Heading\n\n[![badge](badge.svg)](https://example.test)\n\nThis README paragraph explains the project in enough useful detail.\n");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ description: "This manifest description should lose to the overview prose." }));
+    const description = await discoverProjectDescription(root, ["package.json", "README.md"]);
+    assert.equal(description.text, "This README paragraph explains the project in enough useful detail.");
+    assert.equal(description.sourceLabel, "From README.md");
+    const edited = await discoverProjectDescription(root, ["package.json", "README.md"], "A private Project Deck override with four useful words.");
+    assert.equal(edited.source, "local");
+    assert.equal(edited.sourceLabel, "Edited in Project Deck");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("falls through malformed sources to ordered project manifests", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-manifest-description-test-"));
+  try {
+    await writeFile(path.join(root, "README.md"), "# Heading only\n");
+    await writeFile(path.join(root, "package.json"), "not json");
+    await writeFile(path.join(root, "pyproject.toml"), "[project]\nname = \"fixture\"\ndescription = \"A Python project description with enough useful local detail.\"\n\n[tool.poetry]\ndescription = \"This lower-priority value should not win.\"\n");
+    const description = await discoverProjectDescription(root, ["README.md", "package.json", "pyproject.toml"]);
+    assert.equal(description.text, "A Python project description with enough useful local detail.");
+    assert.equal(description.sourceLabel, "From pyproject.toml");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("description acceptance and truncation use frozen code-point boundaries", () => {
+  assert.equal(descriptionFromOverview("one two abcdefghijklmnop"), null);
+  assert.equal(descriptionFromOverview("one two three four 123456"), "one two three four 123456");
+  assert.equal(Array.from(compactDescription("🙂".repeat(181))).length, 180);
+  assert.equal(compactDescription("🙂".repeat(181)).endsWith("…"), true);
+});
+
+test("persists path-scoped project intent without same-name root collisions", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-preferences-test-"));
+  const rootA = path.join(temp, "a"); const rootB = path.join(temp, "b"); const settingsPath = path.join(temp, "settings.json");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_SETTINGS_PATH = settingsPath; process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(rootA, "atlas"), { recursive: true }); await mkdir(path.join(rootB, "atlas"), { recursive: true });
+    await writeFile(path.join(rootA, "atlas", "README.md"), "Atlas A is a useful local project with clear descriptive prose.\n");
+    await writeFile(path.join(rootB, "atlas", "README.md"), "Atlas B is another useful project with different descriptive prose.\n");
+    process.env.GIT_SCAN_ROOT = rootA; await loadProjectsRoot(); await setProjectPreferences("atlas", { ignored: true, description: "A private description saved only for Atlas A." });
+    assert.equal((await scanProjects()).projects[0].preferences.ignored, true);
+    assert.equal((await scanProjects()).projects[0].description.source, "local");
+    process.env.GIT_SCAN_ROOT = rootB; await loadProjectsRoot();
+    const b = (await scanProjects()).projects[0]; assert.equal(b.preferences.ignored, false); assert.equal(b.description.source, "file");
+    await setProjectPreferences("atlas", { localOnly: true });
+    process.env.GIT_SCAN_ROOT = rootA; await loadProjectsRoot();
+    const a = (await scanProjects()).projects[0]; assert.deepEqual(a.preferences, { ignored: true, localOnly: false });
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("canonical paths unify symlink aliases for existing projects", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-path-test-"));
+  try {
+    const real = path.join(temp, "real"); const alias = path.join(temp, "alias"); await mkdir(real); await symlink(real, alias);
+    assert.equal(await canonicalizeProjectPath(`${alias}/`), await canonicalizeProjectPath(real));
+  } finally { await rm(temp, { recursive: true, force: true }); }
+});
+
+test("server-side local-only intent blocks every GitHub mutation while allowing local Git initialization", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-local-only-action-test-"));
+  const root = path.join(temp, "root"); const settingsPath = path.join(temp, "settings.json");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_ROOT = root; process.env.GIT_SCAN_SETTINGS_PATH = settingsPath; process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(root, "atlas"), { recursive: true });
+    await writeFile(path.join(root, "atlas", "README.md"), "Atlas is a useful local-only project for action guard testing.\n");
+    await loadProjectsRoot();
+    await setProjectPreferences("atlas", { localOnly: true });
+    const initialized = await initializeProject("atlas");
+    assert.equal(initialized.project.git.isRepository, true);
+    for (const operation of [
+      () => linkMatchedRepository("atlas"),
+      () => createGithubRepository("atlas", "private"),
+      () => commitAndPushProject("atlas", "Initial commit"),
+    ]) {
+      await assert.rejects(operation, (error: unknown) => error instanceof ProjectActionError && error.code === "local_only" && /atlas is marked Local only/u.test(error.message));
+    }
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+function actionFixture(name: string, patch: Partial<ProjectRecord> = {}): ProjectRecord {
+  return {
+    name, canonicalPath: `/tmp/${name}`, pathLabel: `~/tmp/${name}`,
+    description: { text: "Action fixture.", compact: "Action fixture.", source: "file", sourceLabel: "From README.md", sourceFile: "README.md" },
+    summary: "Action fixture.", preferences: { ignored: false, localOnly: false }, technologies: [], modifiedAt: "2026-01-01T00:00:00.000Z",
+    size: { status: "complete", bytes: 1 },
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "linked", repository: { name, nameWithOwner: `person/${name}`, url: `https://github.com/person/${name}`, isPrivate: true } },
+    sync: { state: "unpublished", ahead: 1, behind: 0, checkedRemote: true, detail: "Not pushed." },
+    ...patch,
+  };
+}
+
+test("initial commit push failure reports partial truth and a retry never repeats the commit", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-initial-push-test-")); const root = path.join(temp, "root"); const projectPath = path.join(root, "atlas");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_ROOT = root; process.env.GIT_SCAN_SETTINGS_PATH = path.join(temp, "settings.json"); process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(projectPath, ".git"), { recursive: true }); await loadProjectsRoot();
+    const calls: string[] = [];
+    const execute = async (_command: string, args: string[]) => {
+      const key = args.join(" "); calls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "ls-files --others --exclude-standard") return { ok: true, stdout: "file.txt", stderr: "", exitCode: 0 };
+      if (key === "show-ref --verify refs/remotes/origin/main") return { ok: false, stdout: "", stderr: "", exitCode: 1 };
+      if (key === "status --porcelain") return { ok: true, stdout: "?? file.txt", stderr: "", exitCode: 0 };
+      if (key === "rev-parse HEAD") return { ok: false, stdout: "", stderr: "", exitCode: 128 };
+      if (key === "push -u origin main") return { ok: false, stdout: "", stderr: "remote unavailable", exitCode: 1 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    await assert.rejects(
+      () => commitAndPushProject("atlas", "Initial commit", { execute, refresh: async () => actionFixture("atlas") }),
+      (error: unknown) => error instanceof ProjectActionError && error.code === "initial_push_failed" && error.message.startsWith("Initial commit created locally, but push failed") && error.project?.git.hasCommits === true,
+    );
+    assert.equal(calls.filter((call) => call.startsWith("commit ")).length, 1);
+    assert.equal(calls.filter((call) => call.startsWith("push ")).length, 1);
+
+    const retryCalls: string[] = [];
+    const retry = async (_command: string, args: string[]) => {
+      const key = args.join(" "); retryCalls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "show-ref --verify refs/remotes/origin/main") return { ok: false, stdout: "", stderr: "", exitCode: 1 };
+      if (key === "rev-parse HEAD") return { ok: true, stdout: "abc123", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    const result = await commitAndPushProject("atlas", "", { execute: retry, refresh: async () => actionFixture("atlas", { sync: { state: "in_sync", ahead: 0, behind: 0, checkedRemote: true, detail: "In sync." } }) });
+    assert.equal(result.message, "Pushed local commits to GitHub.");
+    assert.equal(retryCalls.some((call) => call.startsWith("commit ")), false);
+    assert.equal(retryCalls.filter((call) => call.startsWith("push ")).length, 1);
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("empty initial commit and pre-push failure boundaries are deterministic", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-empty-commit-test-")); const root = path.join(temp, "root"); const projectPath = path.join(root, "atlas");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_ROOT = root; process.env.GIT_SCAN_SETTINGS_PATH = path.join(temp, "settings.json"); process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(projectPath, ".git"), { recursive: true }); await loadProjectsRoot();
+    const calls: string[] = [];
+    const execute = async (_command: string, args: string[]) => {
+      const key = args.join(" "); calls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "show-ref --verify refs/remotes/origin/main") return { ok: false, stdout: "", stderr: "", exitCode: 1 };
+      if (key === "rev-parse HEAD") return { ok: false, stdout: "", stderr: "", exitCode: 128 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    const result = await commitAndPushProject("atlas", "Empty baseline", { execute, refresh: async () => actionFixture("atlas") });
+    assert.equal(result.message, "Empty initial commit created and pushed to GitHub.");
+    assert.equal(calls.includes("commit --allow-empty -m Empty baseline"), true);
+
+    const noMessageCalls: string[] = [];
+    const noMessage = async (_command: string, args: string[]) => {
+      const key = args.join(" "); noMessageCalls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "show-ref --verify refs/remotes/origin/main") return { ok: false, stdout: "", stderr: "", exitCode: 1 };
+      if (key === "status --porcelain") return { ok: true, stdout: " M file.txt", stderr: "", exitCode: 0 };
+      if (key === "rev-parse HEAD") return { ok: true, stdout: "abc123", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    await assert.rejects(() => commitAndPushProject("atlas", " ", { execute: noMessage }), (error: unknown) => error instanceof ProjectActionError && error.code === "commit_message_required");
+    assert.equal(noMessageCalls.some((call) => call.startsWith("git add") || call.startsWith("add ") || call.startsWith("push ")), false);
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
 });

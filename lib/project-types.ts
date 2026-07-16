@@ -25,10 +25,31 @@ export type ProjectSize =
       message: "Size unavailable because part of this folder could not be read.";
     };
 
+export type DescriptionSource = "local" | "file" | "none" | "checking";
+
+export interface ProjectDescription {
+  /** Full normalized value. Never visually-derived or line-clamped. */
+  text: string;
+  /** Deterministic 180-code-point ledger value. */
+  compact: string;
+  source: DescriptionSource;
+  sourceLabel: string;
+  sourceFile: string | null;
+}
+
+export interface ProjectPreferences {
+  ignored: boolean;
+  localOnly: boolean;
+}
+
 export interface ProjectRecord {
   name: string;
+  canonicalPath: string;
   pathLabel: string;
+  description: ProjectDescription;
+  /** Kept as a compact compatibility alias for existing clients. */
   summary: string;
+  preferences: ProjectPreferences;
   technologies: string[];
   modifiedAt: string;
   size: ProjectSize;
@@ -52,9 +73,13 @@ export interface ProjectRecord {
     checkedRemote: boolean;
     detail: string;
   };
+  /** Facts still being refreshed. A usable value in the matching field is the
+   * last successful value; an unavailable placeholder is pending, not failed. */
+  transient?: Partial<Record<"size" | "git" | "github" | "sync", "checking">>;
 }
 
 export interface ProjectScanResponse {
+  rootPath: string;
   rootLabel: string;
   scannedAt: string;
   enriching?: boolean;
@@ -69,4 +94,11 @@ export interface ActionResponse {
   ok: true;
   message: string;
   project: ProjectRecord;
+}
+
+export interface ActionFailureResponse {
+  ok: false;
+  error: string;
+  code?: string;
+  project?: ProjectRecord;
 }
