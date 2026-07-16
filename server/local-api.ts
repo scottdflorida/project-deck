@@ -3,14 +3,17 @@ import type { ActionResponse } from "../lib/project-types";
 import {
   commitAndPushProject,
   chooseProjectsRoot,
+  clearGithubContextCache,
   createGithubRepository,
   initializeProject,
   linkMatchedRepository,
   ProjectActionError,
   loadProjectsRoot,
+  getGithubAuthentication,
   scanProjects,
   scanProjectsQuick,
   setProjectsRoot,
+  startGithubAuthentication,
 } from "./project-scanner";
 
 const port = Number.parseInt(process.env.GIT_SCAN_API_PORT || "4317", 10);
@@ -22,6 +25,7 @@ let quickScanInFlight: Promise<ScanResult> | null = null;
 let quickSizeScanInFlight: Promise<ScanResult> | null = null;
 const scansInFlight = new Map<string, Promise<ScanResult>>();
 let scanGeneration = 0;
+let lastAuthenticatedGithubLogin: string | null = null;
 
 function invalidateScanCaches() {
   scanGeneration += 1;
@@ -129,6 +133,22 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/projects") {
       const refreshRemote = url.searchParams.get("refresh") === "remote";
       sendJson(response, 200, await getProjectScan(refreshRemote));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/github/auth") {
+      const auth = await getGithubAuthentication();
+      if (auth.connected && auth.login !== lastAuthenticatedGithubLogin) {
+        lastAuthenticatedGithubLogin = auth.login;
+        clearGithubContextCache();
+        invalidateScanCaches();
+      }
+      sendJson(response, 200, auth);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/github/auth") {
+      sendJson(response, 200, await startGithubAuthentication());
       return;
     }
 

@@ -31,7 +31,20 @@ before staging.
 - Git
 - [GitHub CLI](https://cli.github.com/) for GitHub status and actions
 
-Authenticate GitHub CLI once if needed:
+## First-run setup
+
+The first time Project Deck opens, a two-step setup appears in the web app:
+
+1. Choose the parent folder containing your projects.
+2. Connect your GitHub account, or continue with local Git information only.
+
+Project Deck checks the GitHub CLI installed on that computer. If it is not
+already authenticated, **Connect** displays a one-time device code and opens
+GitHub's secure device page. Every person who downloads the repository signs in
+with their own local GitHub credentials; no account, token, folder path, or
+authentication state is included in this repository.
+
+You can also authenticate GitHub CLI in a terminal:
 
 ```bash
 gh auth login
@@ -45,10 +58,10 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The command starts both the
-dashboard and its loopback-only filesystem service. Choose **Folder** in the
-header to select the parent directory that contains your projects. You can use
-the native macOS folder browser or enter an absolute/`~/` path on any platform.
-The choice is saved locally and is never committed.
+dashboard and its loopback-only filesystem service. Choose **Choose folder** in
+the header to select the parent directory that contains your projects. You can
+use the native macOS folder browser or enter an absolute/`~/` path on any
+platform. The choice is saved locally and is never committed.
 
 Project names render first, sizes follow, and Git/GitHub details enrich in the
 background so large folders do not block the dashboard. Choose **Refresh** to
@@ -56,9 +69,9 @@ fetch current GitHub state.
 
 ## Configuration
 
-The first launch defaults to `~/Documents`. The in-app folder picker is the
-normal way to change it. These optional environment variables are useful for
-development, testing, and managed installations:
+The first launch defaults to `~/Documents`. The first-run setup and in-app
+folder picker are the normal way to change it. These optional environment
+variables are useful for development, testing, and managed installations:
 
 - `GIT_SCAN_ROOT`: project root to scan instead of `~/Documents`
 - `GIT_SCAN_API_PORT`: local service port instead of `4317`

@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, lstat, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
@@ -81,6 +81,7 @@ type GithubContext = {
 
 let githubContextCache: { createdAt: number; value: GithubContext } | null = null;
 let githubContextInFlight: Promise<GithubContext> | null = null;
+let githubLoginInFlight: Promise<{ code: string; verificationUrl: string }> | null = null;
 
 export class ProjectActionError extends Error {
   status: number;
@@ -90,6 +91,61 @@ export class ProjectActionError extends Error {
     this.name = "ProjectActionError";
     this.status = status;
   }
+}
+
+export async function getGithubAuthentication() {
+  const root = getProjectsRoot();
+  const version = await run("gh", ["--version"], root, 1_500);
+  if (!version.ok) return { cliAvailable: false, connected: false, login: null };
+  const user = await run("gh", ["api", "user", "--jq", ".login"], root, 4_000);
+  return {
+    cliAvailable: true,
+    connected: user.ok && Boolean(user.stdout),
+    login: user.ok && user.stdout ? user.stdout : null,
+  };
+}
+
+export function clearGithubContextCache() {
+  githubContextCache = null;
+  githubContextInFlight = null;
+}
+
+export async function startGithubAuthentication() {
+  const current = await getGithubAuthentication();
+  if (current.connected) return { ...current, code: null, verificationUrl: null };
+  if (!current.cliAvailable) {
+    throw new ProjectActionError(
+      "Install GitHub CLI first, then return here to connect your account.",
+      501,
+    );
+  }
+  githubLoginInFlight ??= new Promise((resolve, reject) => {
+    const child = spawn("gh", ["auth", "login", "-h", "github.com", "-p", "https", "-w"], {
+      cwd: getProjectsRoot(),
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      stdio: "pipe",
+    });
+    let output = "";
+    let delivered = false;
+    const inspect = (chunk: Buffer | string) => {
+      output += chunk.toString().replace(/\u001b\[[0-9;]*m/gu, "");
+      const code = output.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/u)?.[0];
+      if (!code || delivered) return;
+      delivered = true;
+      child.stdin.write("\n");
+      resolve({ code, verificationUrl: "https://github.com/login/device" });
+    };
+    child.stdout.on("data", inspect);
+    child.stderr.on("data", inspect);
+    child.on("error", () => reject(new ProjectActionError("GitHub CLI could not start.", 500)));
+    child.on("exit", () => {
+      githubLoginInFlight = null;
+      if (!delivered) {
+        reject(new ProjectActionError("GitHub sign-in could not be started.", 500));
+      }
+    });
+  });
+  return githubLoginInFlight;
 }
 
 let selectedProjectsRoot = path.resolve(process.env.GIT_SCAN_ROOT || DEFAULT_ROOT);
@@ -237,6 +293,35 @@ async function measureProjectSizeForScan(projectPath: string, root: string) {
   return Number.isSafeInteger(bytes) && bytes >= 0
     ? ({ status: "complete", bytes } satisfies ProjectSize)
     : { ...SIZE_ERROR };
+}
+
+async function measureProjectSizesForRoot(root: string, folderNames: string[]) {
+  const sizes = new Map<string, ProjectSize>();
+  if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0") {
+    const measured = await mapWithConcurrency(folderNames, 16, async (name) => [
+      name,
+      await measureProjectSize(path.join(root, name)),
+    ] as const);
+    for (const [name, size] of measured) sizes.set(name, size);
+    return sizes;
+  }
+
+  const projectPaths = folderNames.map((name) => path.join(root, name));
+  const result = await run("du", ["-sk", ...projectPaths], root, 30_000);
+  for (const line of result.stdout.split("\n")) {
+    const match = line.match(/^(\d+)\s+(.+)$/u);
+    if (!match) continue;
+    const folderPath = path.resolve(match[2]);
+    const name = path.basename(folderPath);
+    const bytes = Number.parseInt(match[1], 10) * 1024;
+    if (folderNames.includes(name) && Number.isSafeInteger(bytes)) {
+      sizes.set(name, { status: "complete", bytes });
+    }
+  }
+  for (const name of folderNames) {
+    if (!sizes.has(name)) sizes.set(name, { ...SIZE_ERROR });
+  }
+  return sizes;
 }
 
 function friendlyCommandError(result: CommandResult, fallback: string) {
@@ -801,18 +886,20 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
     };
   }
 
+  const [projectSizes, github] = await Promise.all([
+    measureProjectSizesForRoot(root, folderNames),
+    getGithubContext(root),
+  ]);
   const projects = await mapWithConcurrency(folderNames, 32, async (name) => {
     const projectPath = path.join(root, name);
-    const [projectEntries, projectStat, size, isRepository] = await Promise.all([
+    const [projectEntries, projectStat, isRepository] = await Promise.all([
       readdir(projectPath, { withFileTypes: true }).catch(() => []),
       stat(projectPath),
-      includeSizes
-        ? measureProjectSizeForScan(projectPath, root)
-        : Promise.resolve({ ...SIZE_ERROR }),
       exists(path.join(projectPath, ".git")),
     ]);
     const names = projectEntries.map((entry) => entry.name);
     let branch: string | null = null;
+    let linkedRepository: GithubRepository | null = null;
     if (isRepository) {
       try {
         const head = (await readFile(path.join(projectPath, ".git", "HEAD"), "utf8")).trim();
@@ -820,7 +907,23 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
       } catch {
         branch = null;
       }
+      try {
+        const config = await readFile(path.join(projectPath, ".git", "config"), "utf8");
+        const origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim();
+        const parsed = origin ? parseGithubRemote(origin) : null;
+        if (parsed) {
+          linkedRepository = github.byFullName.get(parsed.nameWithOwner.toLowerCase()) || {
+            name: parsed.repo,
+            nameWithOwner: parsed.nameWithOwner,
+            url: parsed.url,
+            isPrivate: null,
+          };
+        }
+      } catch {
+        linkedRepository = null;
+      }
     }
+    const matchedRepository = github.byName.get(name.toLowerCase()) || null;
 
     return {
       name,
@@ -828,7 +931,7 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
       summary: await readProjectDescription(projectPath, names),
       technologies: detectTechnologies(names),
       modifiedAt: projectStat.mtime.toISOString(),
-      size,
+      size: projectSizes.get(name) || { ...SIZE_ERROR },
       git: {
         isRepository,
         branch,
@@ -838,13 +941,18 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
         lastCommitAt: null,
         lastCommitMessage: null,
       },
-      github: { state: "unavailable" as const, repository: null },
+      github: {
+        state: linkedRepository ? "linked" as const : matchedRepository ? "matched" as const : github.available ? "none" as const : "unavailable" as const,
+        repository: linkedRepository || matchedRepository,
+      },
       sync: {
-        state: "unavailable" as const,
+        state: linkedRepository ? "unavailable" as const : "no_remote" as const,
         ahead: 0,
         behind: 0,
         checkedRemote: false,
-        detail: "Git and GitHub status are still being checked in the background.",
+        detail: linkedRepository
+          ? "The GitHub remote is linked; commit and sync details are still being checked."
+          : "No GitHub remote is linked.",
       },
     } satisfies ProjectRecord;
   });
@@ -853,7 +961,7 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
     rootLabel: rootLabel(root),
     scannedAt: new Date().toISOString(),
     enriching: true,
-    github: { available: false, login: null },
+    github: { available: github.available, login: github.login },
     projects,
   };
 }
