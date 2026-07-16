@@ -36,11 +36,21 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .topbar { position: sticky; top: 0; z-index: 30; min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 8px max(20px, calc((100vw - 1420px) / 2)); border-bottom: 1px solid var(--line); background: rgba(244,243,239,.96); backdrop-filter: blur(12px); }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; font: 600 11px var(--font-geist-mono), monospace; letter-spacing: .12em; }
 .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--ink); border-radius: 50%; }
-.topbar-context { display: flex; align-items: center; gap: 8px; }
+.topbar-context { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .availability { display: inline-flex; align-items: center; gap: 7px; padding-inline: 7px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .availability i { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px var(--good-wash); }
 .availability.online i { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
 .availability.offline i { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-wash); }
+.root-control { min-width: 0; height: 40px; display: flex; align-items: stretch; border: 1px solid var(--line-strong); border-radius: 5px; background: rgba(255,255,255,.46); overflow: hidden; }
+.root-current { min-width: 130px; max-width: 230px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--muted); }
+.root-current > span { min-width: 0; display: grid; gap: 1px; }
+.root-current small { color: var(--faint); font: 8px var(--font-geist-mono), monospace; letter-spacing: .08em; text-transform: uppercase; }
+.root-current strong { overflow: hidden; color: var(--ink-2); font: 500 11px var(--font-geist-mono), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.root-action { min-width: 62px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 9px; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 10px; }
+.root-action:hover:not(:disabled) { background: var(--surface-strong); color: var(--ink); }
+.github-connect { border-color: #9ba9d8; background: var(--accent-wash); color: var(--accent-dark); }
+.github-connect:hover:not(:disabled) { border-color: var(--accent); }
+.refresh-button { color: var(--muted); }
 .dashboard-content { width: min(1420px, calc(100% - 40px)); margin: auto; padding: 28px 0 72px; }
 
 .working-header { min-height: 126px; display: grid; grid-template-columns: minmax(360px, 1fr) minmax(520px, .9fr); gap: 48px; align-items: end; padding: 6px 0 24px; }
@@ -77,11 +87,15 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .sort-controls select { height: 40px; padding: 0 27px 0 7px; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 11px; }
 .direction-button { gap: 6px; padding: 0 10px; color: var(--ink-2); font-size: 11px; }
 
-.stale-banner, .error-banner { display: flex; align-items: center; gap: 11px; margin-top: 14px; padding: 11px 13px; border: 1px solid #e0bf8f; border-radius: 5px; background: #fff9ef; color: #744914; font-size: 12px; }
+.stale-banner, .error-banner, .github-auth-banner { display: flex; align-items: center; gap: 11px; margin-top: 14px; padding: 11px 13px; border: 1px solid #e0bf8f; border-radius: 5px; background: #fff9ef; color: #744914; font-size: 12px; }
 .stale-banner > div { display: grid; gap: 2px; flex: 1; }
 .stale-banner span { color: #6f5a3e; }
 .error-banner { border-color: #dfb4b1; background: var(--bad-wash); color: #7f2e2e; }
 .error-banner span { flex: 1; overflow-wrap: anywhere; }
+.github-auth-banner { border-color: #aab5dc; background: var(--accent-wash); color: var(--accent-dark); }
+.github-auth-banner > div { flex: 1; display: grid; gap: 2px; }
+.github-auth-banner span { color: var(--muted); }
+.github-auth-banner code { padding: 2px 5px; border-radius: 3px; background: white; color: var(--ink); font-weight: 650; letter-spacing: .08em; }
 
 .ledger { margin-top: 20px; border-top: 1px solid var(--ink); }
 .ledger > header { display: grid; grid-template-columns: 1fr; gap: 13px; align-items: end; min-height: 82px; padding: 15px 12px 10px; }
@@ -137,12 +151,14 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .rail-stop.warn::before { background: var(--warn); box-shadow: 0 0 0 1px var(--warn); }
 .rail-stop.bad::before { background: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
 .rail-stop.unavailable::before { background: var(--surface); box-shadow: 0 0 0 1px var(--faint); }
+.rail-stop.checking::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
 .rail-stop > span { display: flex; align-items: center; gap: 5px; color: var(--faint); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
 .rail-stop strong { display: block; margin-top: 8px; overflow-wrap: anywhere; color: var(--ink-2); font-size: 11px; line-height: 1.25; font-weight: 560; }
 .rail-stop small { display: -webkit-box; margin-top: 4px; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--faint); font-size: 9px; line-height: 1.35; }
 .rail-stop.good > span { color: var(--good); }
 .rail-stop.warn > span { color: var(--warn); }
 .rail-stop.bad > span { color: var(--bad); }
+.rail-stop.checking > span { color: var(--accent-dark); }
 
 .record-actions { min-width: 0; display: grid; gap: 10px; justify-items: start; }
 .primary-action { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -208,6 +224,8 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 @keyframes pulse { 50% { opacity: .45; } }
 
 @media (max-width: 1120px) {
+  .topbar-context > .availability:first-child { display: none; }
+  .root-current { max-width: 170px; }
   .working-header { grid-template-columns: 1fr; gap: 18px; }
   .control-band { grid-template-columns: minmax(260px, 1fr) auto; }
   .sort-controls { grid-column: 1 / 3; justify-content: flex-end; }
@@ -224,6 +242,12 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
   .topbar-context .availability { display: none; }
   .topbar-context .button { width: 44px; min-height: 44px; padding: 0; font-size: 0; }
   .topbar-context .button svg { width: 17px; height: 17px; }
+  .root-control { height: 44px; }
+  .root-current { min-width: 0; max-width: 108px; padding-inline: 8px; }
+  .root-current small { display: none; }
+  .root-action { min-width: 40px; width: 40px; padding: 0; font-size: 0; }
+  .github-auth-banner { align-items: flex-start; flex-wrap: wrap; }
+  .github-auth-banner .button { margin-left: 28px; }
   .dashboard-content { width: min(100% - 24px, 620px); padding-top: 20px; }
   .working-header { min-height: 0; padding-bottom: 20px; }
   .working-header h1 { font-size: 36px; }
@@ -262,6 +286,9 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 }
 
 @media (max-width: 420px) {
+  .brand { display: none; }
+  .topbar-context { width: 100%; gap: 4px; justify-content: space-between; }
+  .root-current { max-width: 90px; }
   .dashboard-content { width: calc(100% - 18px); }
   .view-tabs { width: calc(100vw - 18px); }
   .repository-rail { grid-template-columns: 1fr; padding-left: 14px; }
@@ -276,7 +303,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 }
 
 @media (pointer: coarse) {
-  .button, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .record-utilities a, .record-utilities summary, .search-field button, .project-action-error button { min-height: 44px; }
+  .button, .root-action, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .record-utilities a, .record-utilities summary, .search-field button, .project-action-error button { min-height: 44px; }
   .record-utilities a, .record-utilities summary { display: inline-flex; align-items: center; }
 }
 

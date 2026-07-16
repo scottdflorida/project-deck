@@ -90,6 +90,12 @@ export interface ProjectScanResponse {
   projects: ProjectRecord[];
 }
 
+export interface UnchangedRootResponse {
+  unchanged: true;
+}
+
+export type RootSelectionResponse = ProjectScanResponse | UnchangedRootResponse;
+
 export interface ActionResponse {
   ok: true;
   message: string;

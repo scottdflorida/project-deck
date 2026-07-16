@@ -229,7 +229,12 @@ export async function loadProjectsRoot() {
 }
 
 export async function setProjectsRoot(value: string) {
-  selectedProjectsRoot = await validateProjectsRoot(value);
+  const requestedRoot = path.resolve(expandHome(value));
+  const currentRoot = getProjectsRoot();
+  if (requestedRoot === currentRoot) return currentRoot;
+  const nextRoot = await validateProjectsRoot(value);
+  if (nextRoot === selectedProjectsRoot) return selectedProjectsRoot;
+  selectedProjectsRoot = nextRoot;
   settings = { ...settings, root: selectedProjectsRoot };
   await persistSettings();
   return selectedProjectsRoot;
@@ -282,6 +287,18 @@ export function getProjectsRoot() {
   return path.resolve(process.env.GIT_SCAN_ROOT || selectedProjectsRoot);
 }
 
+export async function openProjectsRoot() {
+  const root = getProjectsRoot();
+  const system = platform();
+  const command = system === "darwin" ? "open" : system === "win32" ? "explorer" : "xdg-open";
+  try {
+    await execFileAsync(command, [root], { encoding: "utf8", timeout: 5_000 });
+  } catch {
+    throw new ProjectActionError("The selected folder could not be opened in the system file browser.", 500);
+  }
+  return root;
+}
+
 function rootLabel(root: string) {
   const home = homedir();
   return root.startsWith(home) ? `~${root.slice(home.length)}` : root;
@@ -293,6 +310,20 @@ async function exists(filePath: string) {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function settleWithin<T>(work: Promise<T>, timeoutMs: number, fallback: T) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      work.catch(() => fallback),
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -962,7 +993,10 @@ export async function scanProjects(refreshRemote = false): Promise<ProjectScanRe
  * API serves this inventory immediately while scanProjects enriches it in the
  * background with working-tree, GitHub, and sync details.
  */
-export async function scanProjectsQuick(includeSizes = false): Promise<ProjectScanResponse> {
+export async function scanProjectsQuick(
+  includeSizes = false,
+  onFacts?: (value: ProjectScanResponse) => void,
+): Promise<ProjectScanResponse> {
   const root = getProjectsRoot();
   const entries = await readdir(root, { withFileTypes: true });
   const folderNames = entries
@@ -1013,10 +1047,48 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
     };
   }
 
-  const [projectSizes, github] = await Promise.all([
-    measureProjectSizesForRoot(root, folderNames),
-    getGithubContext(root),
-  ]);
+  const projectSizesPromise = measureProjectSizesForRoot(root, folderNames);
+  const githubPromise = getGithubContext(root);
+  const fastNow = new Date().toISOString();
+  const fastProjects = await mapWithConcurrency(folderNames, 32, async (name) => {
+    const projectPath = path.join(root, name);
+    const gitExists = await settleWithin(
+      lstat(path.join(projectPath, ".git")).then(() => true, () => false),
+      800,
+      null as boolean | null,
+    );
+    let branch: string | null = null;
+    let linkedRepository: GithubRepository | null = null;
+    if (gitExists === true) {
+      const head = await settleWithin(readFile(path.join(projectPath, ".git", "HEAD"), "utf8"), 800, "");
+      const trimmedHead = head.trim();
+      branch = trimmedHead.startsWith("ref: refs/heads/") ? trimmedHead.slice("ref: refs/heads/".length) : null;
+      const config = await settleWithin(readFile(path.join(projectPath, ".git", "config"), "utf8"), 800, "");
+      const origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim();
+      const parsed = origin ? parseGithubRemote(origin) : null;
+      if (parsed) linkedRepository = { name: parsed.repo, nameWithOwner: parsed.nameWithOwner, url: parsed.url, isPrivate: null };
+    }
+    const projectPreference = preferenceFor(projectPath);
+    const description: ProjectDescription = { text: "", compact: "", source: "checking", sourceLabel: "Checking local description…", sourceFile: null };
+    return {
+      name,
+      canonicalPath: projectPath,
+      pathLabel: `${rootLabel(root)}/${name}`,
+      description,
+      summary: "",
+      preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
+      technologies: [],
+      modifiedAt: fastNow,
+      size: { ...SIZE_ERROR },
+      git: { isRepository: gitExists === true, branch, hasCommits: gitExists === true, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+      github: { state: linkedRepository ? "linked" as const : "unavailable" as const, repository: linkedRepository },
+      sync: { state: linkedRepository ? "unavailable" as const : gitExists === null ? "unavailable" as const : "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: linkedRepository ? "The GitHub remote is linked; detailed sync status is still being checked." : gitExists === null ? "Local Git metadata is still being checked." : "No GitHub remote is linked." },
+      transient: { size: "checking" as const, ...(gitExists === null || gitExists === true ? { git: "checking" as const } : {}), ...(gitExists === null ? { github: "checking" as const, sync: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
+    } satisfies ProjectRecord;
+  });
+  onFacts?.({ rootPath: root, rootLabel: rootLabel(root), scannedAt: fastNow, enriching: true, github: { available: false, login: null }, projects: fastProjects });
+
+  const github = await githubPromise;
   const projects = await mapWithConcurrency(folderNames, 32, async (name) => {
     const projectPath = path.join(root, name);
     const canonicalPath = await canonicalizeProjectPath(projectPath);
@@ -1064,7 +1136,7 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
       preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies: detectTechnologies(names),
       modifiedAt: projectStat.mtime.toISOString(),
-      size: projectSizes.get(name) || { ...SIZE_ERROR },
+      size: { ...SIZE_ERROR },
       git: {
         isRepository,
         branch,
@@ -1087,19 +1159,35 @@ export async function scanProjectsQuick(includeSizes = false): Promise<ProjectSc
           ? "The GitHub remote is linked; commit and sync details are still being checked."
           : "No GitHub remote is linked.",
       },
-      transient: isRepository
-        ? { git: "checking" as const, ...(linkedRepository ? { sync: "checking" as const } : {}) }
-        : undefined,
+      transient: {
+        size: "checking" as const,
+        ...(isRepository ? { git: "checking" as const } : {}),
+        ...(linkedRepository ? { sync: "checking" as const } : {}),
+      },
     } satisfies ProjectRecord;
   });
 
-  return {
+  const factsResponse: ProjectScanResponse = {
     rootPath: root,
     rootLabel: rootLabel(root),
     scannedAt: new Date().toISOString(),
     enriching: true,
     github: { available: github.available, login: github.login },
     projects,
+  };
+  onFacts?.(factsResponse);
+
+  const projectSizes = await projectSizesPromise;
+  return {
+    ...factsResponse,
+    scannedAt: new Date().toISOString(),
+    projects: projects.map((project) => ({
+      ...project,
+      size: projectSizes.get(project.name) || { ...SIZE_ERROR },
+      transient: project.git.isRepository
+        ? { git: "checking" as const, ...(project.github.state === "linked" ? { sync: "checking" as const } : {}) }
+        : undefined,
+    })),
   };
 }
 

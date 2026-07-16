@@ -80,9 +80,18 @@ the header to select the parent directory that contains your projects. You can
 use the native macOS folder browser or enter an absolute/`~/` path on any
 platform. The choice is saved locally and is never committed.
 
-Project names render first, sizes follow, and Git/GitHub details enrich in the
-background so large folders do not block the dashboard. Choose **Refresh** to
-fetch current GitHub state.
+Project names render first, local Git repositories and linked remotes follow,
+then sizes and detailed sync checks continue independently in the background.
+One slow folder cannot hold repository discovery behind disk measurement.
+
+The header always shows the active parent folder. Use **Open** to reveal it in
+the system file browser or **Change** to select another parent. Selecting the
+folder already in use is an immediate no-op and keeps the current dashboard.
+
+When GitHub is disconnected, the header shows **Connect GitHub** rather than an
+ambiguous status. The in-app device flow repairs expired credentials and unlocks
+repository matching, creation, linking, and sync actions. Choose **Refresh** to
+fetch current GitHub state after an external change.
 
 ## Configuration
 

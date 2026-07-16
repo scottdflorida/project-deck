@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -66,6 +66,42 @@ test("scans direct folders, reads descriptions, and reports Git state", async ()
     else process.env.GIT_SCAN_ROOT = previousRoot;
     if (previousGithubSetting === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB;
     else process.env.GIT_SCAN_DISABLE_GITHUB = previousGithubSetting;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("publishes local Git and remote facts before slower size enrichment", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-quick-facts-test-"));
+  const previousRoot = process.env.GIT_SCAN_ROOT;
+  const previousGithubSetting = process.env.GIT_SCAN_DISABLE_GITHUB;
+  const previousNativeSize = process.env.GIT_SCAN_USE_NATIVE_SIZE;
+  process.env.GIT_SCAN_ROOT = root;
+  process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  process.env.GIT_SCAN_USE_NATIVE_SIZE = "0";
+
+  try {
+    const alpha = path.join(root, "alpha");
+    await mkdir(path.join(alpha, ".git"), { recursive: true });
+    await writeFile(path.join(alpha, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(path.join(alpha, ".git", "config"), '[remote "origin"]\n\turl = https://github.com/example/alpha.git\n');
+    await writeFile(path.join(alpha, "README.md"), "Alpha is a useful local project with a linked GitHub repository.\n");
+    await loadProjectsRoot();
+
+    let staged: ProjectRecord | undefined;
+    const completed = await scanProjectsQuick(true, (response) => {
+      staged = response.projects[0];
+    });
+
+    assert.equal(staged?.git.isRepository, true);
+    assert.equal(staged?.git.branch, "main");
+    assert.equal(staged?.github.state, "linked");
+    assert.equal(staged?.transient?.size, "checking");
+    assert.equal(completed.projects[0].size.status, "complete");
+    assert.equal(completed.projects[0].github.state, "linked");
+  } finally {
+    if (previousRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = previousRoot;
+    if (previousGithubSetting === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = previousGithubSetting;
+    if (previousNativeSize === undefined) delete process.env.GIT_SCAN_USE_NATIVE_SIZE; else process.env.GIT_SCAN_USE_NATIVE_SIZE = previousNativeSize;
     await rm(root, { recursive: true, force: true });
   }
 });

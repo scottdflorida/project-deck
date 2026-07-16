@@ -10,6 +10,8 @@ import {
   ProjectActionError,
   loadProjectsRoot,
   getGithubAuthentication,
+  getProjectsRoot,
+  openProjectsRoot,
   scanProjects,
   scanProjectsQuick,
   setProjectsRoot,
@@ -37,36 +39,48 @@ function invalidateScanCaches() {
   scansInFlight.clear();
 }
 
+function startDeepScan(refreshRemote: boolean, generation: number) {
+  const key = `${generation}:${refreshRemote ? "remote" : "local"}`;
+  const existing = scansInFlight.get(key);
+  if (existing) return existing;
+
+  const scan = scanProjects(refreshRemote)
+    .then((value) => {
+      if (generation === scanGeneration) scanCache = { createdAt: Date.now(), value };
+      return value;
+    })
+    .finally(() => scansInFlight.delete(key));
+  scansInFlight.set(key, scan);
+  return scan;
+}
+
 async function getProjectScan(refreshRemote: boolean) {
   if (!refreshRemote && scanCache && Date.now() - scanCache.createdAt < SCAN_CACHE_MS) {
     return scanCache.value;
   }
 
   const generation = scanGeneration;
-  const key = `${generation}:${refreshRemote ? "remote" : "local"}`;
-  const existing = scansInFlight.get(key);
-  if (refreshRemote && existing) return existing;
+  if (refreshRemote) return startDeepScan(true, generation);
 
-  if (!existing) {
-    const scan = scanProjects(refreshRemote)
-      .then((value) => {
-        if (generation === scanGeneration) {
-          scanCache = { createdAt: Date.now(), value };
-        }
-        return value;
-      })
-      .finally(() => scansInFlight.delete(key));
-    scansInFlight.set(key, scan);
-  }
-
-  if (refreshRemote) return scansInFlight.get(key)!;
   if (quickScanCache) return quickScanCache;
   quickScanInFlight ??= scanProjectsQuick(false).then((value) => {
     if (generation === scanGeneration) quickScanCache = value;
-    quickSizeScanInFlight ??= scanProjectsQuick(true)
+    quickSizeScanInFlight ??= scanProjectsQuick(true, (factsValue) => {
+      if (generation === scanGeneration) {
+        quickScanCache = factsValue;
+        void startDeepScan(false, generation);
+      }
+    })
       .then((sizedValue) => {
-        if (generation === scanGeneration) quickScanCache = sizedValue;
+        if (generation === scanGeneration) {
+          quickScanCache = sizedValue;
+          void startDeepScan(false, generation);
+        }
         return sizedValue;
+      })
+      .catch(() => {
+        if (generation === scanGeneration) void startDeepScan(false, generation);
+        return value;
       })
       .finally(() => {
         quickSizeScanInFlight = null;
@@ -158,16 +172,31 @@ const server = createServer(async (request, response) => {
       if (typeof body.path !== "string" || !body.path.trim()) {
         throw new ProjectActionError("Enter a parent folder path.", 400);
       }
-      await setProjectsRoot(body.path);
+      const previousRoot = getProjectsRoot();
+      const nextRoot = await setProjectsRoot(body.path);
+      if (nextRoot === previousRoot) {
+        sendJson(response, 200, { unchanged: true });
+        return;
+      }
       invalidateScanCaches();
       sendJson(response, 200, await getProjectScan(false));
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/api/root/choose") {
-      await chooseProjectsRoot();
+      const previousRoot = getProjectsRoot();
+      const nextRoot = await chooseProjectsRoot();
+      if (nextRoot === previousRoot) {
+        sendJson(response, 200, { unchanged: true });
+        return;
+      }
       invalidateScanCaches();
       sendJson(response, 200, await getProjectScan(false));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/root/open") {
+      sendJson(response, 200, { ok: true, rootPath: await openProjectsRoot() });
       return;
     }
 

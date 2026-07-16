@@ -88,3 +88,14 @@ test("local-only intent ignores remote attention without hiding local Git concer
   assert.equal(needsAttention(localChange), true);
   assert.equal(projectInView({ ...localChange, preferences: { ignored: true, localOnly: true } }, "attention"), false);
 });
+
+test("pending Git discovery is not mislabeled as a project needing attention", () => {
+  const pending = project("pending", {
+    git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "unavailable", repository: null },
+    sync: { state: "unavailable", ahead: 0, behind: 0, checkedRemote: false, detail: "Checking." },
+    transient: { git: "checking", github: "checking", sync: "checking" },
+  });
+  assert.equal(needsAttention(pending), false);
+  assert.equal(projectInView(pending, "attention"), false);
+});

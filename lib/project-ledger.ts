@@ -37,12 +37,14 @@ export function gitProjection(project: ProjectRecord) {
 }
 
 export function needsAttention(project: ProjectRecord) {
+  if (project.transient?.git === "checking") return false;
   if (!project.git.isRepository || !project.git.hasCommits || !project.git.statusAvailable || project.git.changeCount > 0) return true;
   if (project.preferences.localOnly) return false;
   return project.github.state !== "linked" || project.sync.state !== "in_sync";
 }
 
 export function attentionReason(project: ProjectRecord) {
+  if (project.transient?.git === "checking") return "Local Git status is being checked";
   if (!project.git.isRepository) return "Git is not initialized";
   if (!project.git.hasCommits) return "The repository has no commits";
   if (!project.git.statusAvailable) return "Local Git status is unavailable";
