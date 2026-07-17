@@ -24,6 +24,11 @@ const SIZE_ERROR: ProjectSize = {
   message: "Size unavailable because part of this folder could not be read.",
 };
 
+function gitStatusTimeoutMs() {
+  const configured = Number.parseInt(process.env.GIT_SCAN_STATUS_TIMEOUT_MS || "3500", 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : 3_500;
+}
+
 type StoredProjectPreference = {
   ignored?: boolean;
   localOnly?: boolean;
@@ -91,6 +96,7 @@ type CommandResult = {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  timedOut?: boolean;
 };
 
 type LocalGitMetadata = {
@@ -365,12 +371,15 @@ async function run(
       stdout: stdout.trim(),
       stderr: stderr.trim(),
       exitCode: 0,
+      timedOut: false,
     };
   } catch (error) {
     const commandError = error as NodeJS.ErrnoException & {
       stdout?: string;
       stderr?: string;
       code?: string | number;
+      killed?: boolean;
+      signal?: string;
     };
 
     return {
@@ -379,6 +388,7 @@ async function run(
       stderr: String(commandError.stderr || commandError.message || "").trim(),
       exitCode:
         typeof commandError.code === "number" ? commandError.code : null,
+      timedOut: Boolean(commandError.killed || commandError.signal === "SIGTERM" || commandError.code === "ETIMEDOUT"),
     };
   }
 }
@@ -445,10 +455,10 @@ async function readLocalGitMetadata(root: string, projectPath: string): Promise<
       run("head", ["-c", "65536", path.join(commonDir, "config")], root, 1_200),
       head.ref
         ? run("head", ["-c", "128", path.join(commonDir, head.ref)], root, 1_200)
-        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null } satisfies CommandResult),
+        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null, timedOut: false } satisfies CommandResult),
       head.ref
         ? run("head", ["-c", "1048576", path.join(commonDir, "packed-refs")], root, 1_200)
-        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null } satisfies CommandResult),
+        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null, timedOut: false } satisfies CommandResult),
     ]);
     const hasCommits = head.hasCommits
       || GIT_OBJECT_ID.test(refResult.stdout)
@@ -493,6 +503,35 @@ async function readLocalGitMetadata(root: string, projectPath: string): Promise<
     hasCommits: head.hasCommits || GIT_OBJECT_ID.test(refContents.trim()) || Boolean(head.ref && packedRefsContain(packedRefsContents, head.ref)),
     origin: originFromGitConfig(configContents),
   };
+}
+
+/**
+ * Git status can block for minutes when a tracked file is an iCloud placeholder.
+ * An unrelated ignored/untracked placeholder does not make the repository
+ * unreadable, so intersect BSD find's dataless paths with Git's local index.
+ * Both metadata-only commands are bounded and never hydrate file contents.
+ */
+export function includesTrackedOffloadedPath(projectPath: string, offloadedOutput: string, trackedOutput: string) {
+  const trackedPaths = new Set(trackedOutput.split("\u0000").filter(Boolean));
+  return offloadedOutput
+    .split("\u0000")
+    .filter(Boolean)
+    .some((filePath) => trackedPaths.has(path.relative(projectPath, filePath)));
+}
+
+async function hasTrackedOffloadedWorkingFiles(root: string, projectPath: string) {
+  if (platform() !== "darwin") return false;
+  const [offloaded, tracked] = await Promise.all([
+    run(
+      "find",
+      [projectPath, "-path", path.join(projectPath, ".git"), "-prune", "-o", "-type", "f", "-flags", "+dataless", "-print0"],
+      root,
+      1_200,
+    ),
+    run("git", ["ls-files", "-z"], projectPath, 1_200),
+  ]);
+  if (!offloaded.ok || !tracked.ok || !offloaded.stdout || !tracked.stdout) return false;
+  return includesTrackedOffloadedPath(projectPath, offloaded.stdout, tracked.stdout);
 }
 
 /**
@@ -896,7 +935,7 @@ function syncDetail(
   }
 }
 
-async function getSyncState(
+export async function getSyncState(
   projectPath: string,
   branch: string | null,
   hasCommits: boolean,
@@ -1038,15 +1077,14 @@ async function scanProject(
     };
   }
 
+  const offloadedWorkingFiles = await hasTrackedOffloadedWorkingFiles(root, projectPath);
+  const statusPromise = offloadedWorkingFiles
+    ? Promise.resolve({ ok: false, stdout: "", stderr: "Working files are offloaded to iCloud.", exitCode: null, timedOut: false } satisfies CommandResult)
+    : run("git", ["status", "--porcelain", "--untracked-files=normal"], projectPath, gitStatusTimeoutMs());
   const [branchResult, statusResult, headResult, originResult, lastCommitResult] =
     await Promise.all([
       run("git", ["branch", "--show-current"], projectPath),
-      run(
-        "git",
-        ["status", "--porcelain", "--untracked-files=normal"],
-        projectPath,
-        1_500,
-      ),
+      statusPromise,
       run("git", ["rev-parse", "HEAD"], projectPath),
       run("git", ["remote", "get-url", "origin"], projectPath),
       run(
@@ -1101,6 +1139,7 @@ async function scanProject(
       hasCommits,
       changeCount,
       statusAvailable: statusResult.ok,
+      statusReason: statusResult.ok ? null : offloadedWorkingFiles ? "offloaded" : statusResult.timedOut ? "timeout" : "error",
       lastCommitAt: lastCommitParts[0] || null,
       lastCommitMessage: lastCommitParts[1] || null,
     },
@@ -1145,9 +1184,10 @@ export async function scanProjects(refreshRemote = false): Promise<ProjectScanRe
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-  // Most work is independent filesystem/process I/O. A wider bounded pool keeps
-  // a large Documents directory responsive while slow folders time out alone.
-  const projects = await mapWithConcurrency(folderNames, 8, (name) =>
+  // Git itself fans out over index/worktree I/O. A conservative pool avoids
+  // making healthy repositories miss their deadline while a slow folder still
+  // times out independently.
+  const projects = await mapWithConcurrency(folderNames, 4, (name) =>
     scanProject(root, name, github, refreshRemote),
   );
 

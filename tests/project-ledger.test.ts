@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ProjectRecord } from "../lib/project-types";
-import { attentionReason, compareProjects, needsAttention, projectInView } from "../lib/project-ledger";
+import { attentionReason, compareProjects, gitPresentation, githubPresentation, needsAttention, projectActionKey, projectInView, projectSearchText, syncPresentation } from "../lib/project-ledger";
 
 function project(name: string, patch: Partial<ProjectRecord> = {}): ProjectRecord {
   return {
@@ -50,8 +50,8 @@ test("keeps known facts ranked, pending facts next, and unavailable facts last i
   const notGit = project("not-git", { git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } });
   const changed = project("changed", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } });
   const gitValues = [pendingGit, unavailableGit, cachedClean, noCommitsDuringRefresh, changed, notGit];
-  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "asc")).map((item) => item.name), ["not-git", "changed", "cached-clean", "no-commits", "pending-git", "unavailable-git"]);
-  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "desc")).map((item) => item.name), ["cached-clean", "changed", "not-git", "no-commits", "pending-git", "unavailable-git"]);
+  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "asc")).map((item) => item.name), ["not-git", "no-commits", "changed", "cached-clean", "pending-git", "unavailable-git"]);
+  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "desc")).map((item) => item.name), ["cached-clean", "changed", "no-commits", "not-git", "pending-git", "unavailable-git"]);
 
   const githubValues = [
     project("none", { github: { state: "none", repository: null } }),
@@ -102,12 +102,67 @@ test("pending Git discovery is not mislabeled as a project needing attention", (
 
 test("unavailable Git metadata is neither presented as empty nor treated as actionable by itself", () => {
   const unavailable = project("offloaded", {
-    git: { isRepository: true, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null },
   });
-  assert.equal(attentionReason(unavailable), "Local Git status is unavailable");
+  assert.equal(gitPresentation(unavailable).label, "Working tree not checked");
+  assert.equal(attentionReason(unavailable), "No attention needed");
   assert.equal(needsAttention(unavailable), false);
 
   const matched = { ...unavailable, github: { state: "matched" as const, repository: unavailable.github.repository }, sync: { state: "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." } };
   assert.equal(needsAttention(matched), true);
-  assert.equal(attentionReason(matched), "A GitHub match is ready to link");
+  assert.equal(attentionReason(matched), "A GitHub repository is ready to link");
+});
+
+test("canonical presentations freeze user-visible state language and precedence", () => {
+  const states = [
+    [project("pending", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null }, transient: { git: "checking" } }), "Checking…"],
+    [project("folder", { git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }), "Not initialized"],
+    [project("empty", { git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null } }), "No commits"],
+    [project("changed", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }), "2 local changes"],
+    [project("clean"), "Clean"],
+    [project("cloud", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "offloaded", lastCommitAt: null, lastCommitMessage: null } }), "Files offloaded"],
+    [project("slow", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null } }), "Working tree not checked"],
+  ] as const;
+  for (const [value, label] of states) assert.equal(gitPresentation(value).label, label);
+
+  const matched = project("match", {
+    github: { state: "matched", repository: { name: "match", nameWithOwner: "person/match", url: "https://github.com/person/match", isPrivate: false } },
+    sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." },
+  });
+  assert.equal(githubPresentation(matched).label, "Repository found");
+  assert.equal(syncPresentation(matched).label, "Not linked");
+  assert.match(syncPresentation(matched).detail, /person\/match/);
+  assert.equal(projectActionKey(matched, true), "link");
+  assert.match(projectSearchText(matched), /repository found/);
+  assert.doesNotMatch(projectSearchText(matched), /no remote/);
+});
+
+test("action guidance never calls an unchecked working tree up to date", () => {
+  const offloaded = project("cloud", {
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "offloaded", lastCommitAt: null, lastCommitMessage: null },
+  });
+  assert.equal(syncPresentation(offloaded).key, "in_sync");
+  assert.equal(projectActionKey(offloaded, true), "working_tree_not_checked");
+});
+
+test("categorical sorting groups exact displayed states and keeps unresolved states last", () => {
+  const values = [
+    project("clean-z"),
+    project("clean-a"),
+    project("changes-3", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 3, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }),
+    project("changes-1", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 1, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }),
+    project("not-git", { git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }),
+    project("offloaded", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "offloaded", lastCommitAt: null, lastCommitMessage: null } }),
+    project("not-checked", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null } }),
+    project("checking", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null }, transient: { git: "checking" } }),
+  ];
+  for (const direction of ["asc", "desc"] as const) {
+    const sorted = [...values].sort((a, b) => compareProjects(a, b, "git", direction));
+    const labels = sorted.map((value) => gitPresentation(value).key);
+    for (const key of new Set(labels)) {
+      const indexes = labels.flatMap((value, index) => value === key ? [index] : []);
+      assert.equal(indexes.at(-1)! - indexes[0] + 1, indexes.length, `${key} must be contiguous in ${direction}`);
+    }
+    assert.deepEqual(labels.slice(-3), ["checking", "offloaded", "not_checked"]);
+  }
 });

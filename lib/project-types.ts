@@ -59,6 +59,9 @@ export interface ProjectRecord {
     hasCommits: boolean;
     changeCount: number;
     statusAvailable: boolean;
+    /** Why working-tree enumeration did not complete. Repository identity,
+     * branch, commits, and origin remain independently trustworthy. */
+    statusReason?: "offloaded" | "timeout" | "error" | null;
     lastCommitAt: string | null;
     lastCommitMessage: string | null;
   };

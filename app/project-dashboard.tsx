@@ -1,16 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectScanResponse, RootSelectionResponse, SyncState } from "@/lib/project-types";
-import { attentionReason, compareProjects, needsAttention, projectInView, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
+import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectScanResponse, RootSelectionResponse } from "@/lib/project-types";
+import { attentionReason, compareProjects, gitPresentation, githubPresentation, needsAttention, projectActionKey, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
 import { formatProjectSize } from "@/lib/format-project-size";
-import { AlertCircle, ArrowDown, ArrowUp, Check, CircleDot, Copy, ExternalLink, Folder, GitBranch, Github, LoaderCircle, Lock, MoreHorizontal, Pencil, RefreshCw, Search, Unlock, X } from "@/app/icons";
+import { AlertCircle, ArrowDown, ArrowUp, Check, Copy, ExternalLink, Folder, GitBranch, Github, LoaderCircle, Lock, MoreHorizontal, Pencil, RefreshCw, Search, Unlock, X } from "@/app/icons";
 
 const RETRY_MS = 4_000;
 const API_TIMEOUT_MS = 5_000;
 const API_PORT = process.env.NEXT_PUBLIC_PROJECT_DECK_API_PORT || "4317";
 const viewLabels: Record<ProjectView, string> = { working: "Working set", attention: "Needs attention", local: "Local only", ignored: "Ignored" };
-const sortLabels: Record<SortKey, string> = { name: "Name", size: "Size", git: "Git", github: "GitHub", sync: "Sync" };
+const sortLabels: Record<SortKey, string> = { name: "Project", size: "Total size", git: "Git", github: "GitHub", sync: "Sync" };
 type GithubAuthState = { checked: boolean; cliAvailable: boolean; connected: boolean; login: string | null };
 type ProjectActionKind = "init" | "link" | "create-repo" | "push" | "preferences";
 type RepoModal = { type: "create" | "link" | "push"; project: ProjectRecord; trigger: HTMLElement | null };
@@ -38,35 +38,8 @@ async function fetchLocal(path: string, init: RequestInit = {}, timeoutMs = API_
   }
 }
 
-function syncView(state: SyncState, ahead: number, behind: number) {
-  if (state === "in_sync") return { label: "In sync", tone: "good", Icon: Check };
-  if (state === "ahead") return { label: `${ahead} ahead`, tone: "warn", Icon: ArrowUp };
-  if (state === "behind") return { label: `${behind} behind`, tone: "bad", Icon: ArrowDown };
-  if (state === "diverged") return { label: `${ahead} ahead · ${behind} behind`, tone: "bad", Icon: AlertCircle };
-  if (state === "unpublished") return { label: "Not pushed", tone: "warn", Icon: ArrowUp };
-  if (state === "no_commits") return { label: "No commits", tone: "neutral", Icon: CircleDot };
-  if (state === "no_remote") return { label: "No remote", tone: "neutral", Icon: Github };
-  return { label: "Unavailable", tone: "unavailable", Icon: AlertCircle };
-}
-
-function gitView(project: ProjectRecord) {
-  if (project.transient?.git === "checking") return project.git.isRepository
-    ? { label: "Repository found", detail: `${project.git.branch || "Branch unknown"} · checking changes`, tone: "checking" }
-    : { label: "Checking…", detail: "Reading local Git metadata", tone: "checking" };
-  if (!project.git.isRepository) return { label: "Not initialized", detail: "Local folder", tone: "neutral" };
-  if (!project.git.statusAvailable) return { label: "Status unavailable", detail: project.git.branch || "Repository", tone: "unavailable" };
-  if (!project.git.hasCommits) return { label: "Repository, no commits", detail: project.git.branch || "No branch yet", tone: "warn" };
-  if (project.git.changeCount) return { label: `${project.git.changeCount} local ${project.git.changeCount === 1 ? "change" : "changes"}`, detail: project.git.branch || "Detached HEAD", tone: "warn" };
-  return { label: "Repository, clean", detail: project.git.branch || "Detached HEAD", tone: "good" };
-}
-
-function githubView(project: ProjectRecord) {
-  if (project.transient?.github === "checking") return { label: "Checking…", detail: "Looking for GitHub repositories", tone: "checking" };
-  if (project.github.state === "linked") return { label: "Linked", detail: project.github.repository?.nameWithOwner || "GitHub remote", tone: "good" };
-  if (project.github.state === "matched") return { label: "Match found", detail: project.github.repository?.nameWithOwner || "Ready to link", tone: "warn" };
-  if (project.github.state === "unavailable") return { label: "Sign in to check", detail: "Connect GitHub to find or create repositories", tone: "unavailable" };
-  if (project.preferences.localOnly) return { label: "Not planned", detail: "Local only", tone: "neutral" };
-  return { label: "No repository", detail: "Nothing linked", tone: "neutral" };
+function refreshingDetail(detail: string, refreshing: boolean) {
+  return refreshing ? `${detail} · Refreshing…` : detail;
 }
 
 function latestUpdate(project: ProjectRecord) {
@@ -161,32 +134,28 @@ function DescriptionDialog({ modal, busy, error, onClose, onSave, onClear }: { m
 }
 
 function ProjectActions({ project, githubAvailable, busy, onAction, onModal }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; onAction: (kind: "init", trigger: HTMLElement) => void; onModal: (modal: RepoModal) => void }) {
-  if (project.transient?.git === "checking" && !project.git.isRepository) return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking local Git…</span>;
-  if (project.preferences.localOnly) return !project.git.isRepository
-    ? <div className="local-init"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={15}/> Initialize Git</button><small>Creates local .git only</small></div>
-    : <span className="action-guidance"><Check size={14}/> Local only</span>;
-  if (!project.git.isRepository) return <>{project.github.state === "matched"
-    ? <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={15}/> Initialize & link</button>
-    : <div className="local-init"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={15}/> Initialize Git</button><small>Creates local .git only</small></div>}
-    {project.github.state === "none" && githubAvailable && <button className="button secondary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={15}/> Create GitHub repository</button>}</>;
-  if (project.github.state === "matched") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={15}/> Link repository</button>;
-  if (project.github.state === "none" && githubAvailable) return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={15}/> Create GitHub repository</button>;
-  if (project.github.state === "linked") {
-    if (project.transient?.sync === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking sync…</span>;
-    if (["behind", "diverged"].includes(project.sync.state)) return <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
-    if (project.sync.state === "unavailable") return <span className="action-guidance">Remote status unavailable</span>;
-    if (!project.git.hasCommits || project.git.changeCount > 0 || ["ahead", "unpublished"].includes(project.sync.state)) {
-      const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Create initial commit & push" : project.git.changeCount ? "Commit & push" : "Push to GitHub";
-      return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={15}/> {label}</button>;
-    }
-    if (project.sync.state === "in_sync") return <span className="action-guidance good"><Check size={14}/> Up to date</span>;
+  const actionKey = projectActionKey(project, githubAvailable);
+  if (actionKey === "checking_git") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking local Git…</span>;
+  if (actionKey === "init") return <div className="local-init"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={15}/> Initialize Git</button><small>Creates local .git only</small></div>;
+  if (actionKey === "local_only") return <span className="action-guidance"><Check size={14}/> Local only</span>;
+  if (actionKey === "link") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={15}/> {project.git.isRepository ? "Link repository" : "Initialize & link"}</button>;
+  if (actionKey === "create") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={15}/> Create GitHub repository</button>;
+  if (actionKey === "checking_sync") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking sync…</span>;
+  if (actionKey === "reconcile") return <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
+  if (actionKey === "working_tree_not_checked") return <span className="action-guidance">Working tree not checked — make files available, then refresh</span>;
+  if (actionKey === "comparison_not_checked") return <span className="action-guidance">Comparison not checked — refresh to try again</span>;
+  if (actionKey === "push") {
+    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Create initial commit & push" : project.git.changeCount ? "Commit & push" : "Push to GitHub";
+    return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={15}/> {label}</button>;
   }
-  if (!githubAvailable && project.github.state === "unavailable") return <span className="action-guidance">Connect GitHub above to find, create, or link a repository</span>;
+  if (actionKey === "up_to_date") return <span className="action-guidance good"><Check size={14}/> Up to date</span>;
+  if (actionKey === "connect_github") return <span className="action-guidance">Connect GitHub above to discover repositories</span>;
   return <span className="action-guidance">No repository action available</span>;
 }
 
 function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onCopy, onModal, onDismissActionError }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; actionError: ProjectActionFailure | null; onAction: (project: ProjectRecord, kind: "init", trigger: HTMLElement) => void; onCopy: (project: ProjectRecord) => void; onModal: (modal: NonNullable<ModalState>) => void; onDismissActionError: () => void }) {
-  const git = gitView(project); const github = githubView(project); const sync = project.transient?.sync === "checking" ? { label: "Checking…", tone: "checking", Icon: LoaderCircle } : syncView(project.sync.state, project.sync.ahead, project.sync.behind); const update = latestUpdate(project);
+  const git = gitPresentation(project); const github = githubPresentation(project); const sync = syncPresentation(project); const update = latestUpdate(project);
+  const SyncIcon = sync.key === "checking" ? LoaderCircle : sync.key === "in_sync" ? Check : sync.key === "ahead" || sync.key === "not_pushed" ? ArrowUp : sync.key === "behind" ? ArrowDown : sync.key === "diverged" ? AlertCircle : Github;
   const descriptionMissing = project.description.source === "none";
   return <li className="project-row" data-project={project.name} data-project-path={project.canonicalPath}>
     <article className="project-record" aria-labelledby={`project-${encodeURIComponent(project.canonicalPath)}`}>
@@ -197,9 +166,9 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
       </div>
       <div className="project-facts"><div><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong></div><div><span>Latest update:</span><time dateTime={project.git.lastCommitAt || project.modifiedAt || undefined} title={update.exact} aria-label={`Latest update: ${update.relative}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time></div>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
       <div className="repository-rail" aria-label={`Repository state for ${project.name}`}>
-        <div className={`rail-stop ${git.tone}`}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{git.detail}</small></div>
-        <div className={`rail-stop ${github.tone}`}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{github.detail}</small></div>
-        <div className={`rail-stop ${sync.tone}`}><span><sync.Icon size={14}/> Sync</span><strong>{project.preferences.localOnly && project.github.state !== "linked" ? "Not planned" : sync.label}</strong><small>{project.preferences.localOnly && project.github.state !== "linked" ? "Local only" : project.sync.detail}</small></div>
+        <div className={`rail-stop ${git.tone}`} data-state-key={git.key}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{refreshingDetail(git.detail, git.refreshing)}</small></div>
+        <div className={`rail-stop ${github.tone}`} data-state-key={github.key}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{refreshingDetail(github.detail, github.refreshing)}</small></div>
+        <div className={`rail-stop ${sync.tone}`} data-state-key={sync.key}><span><SyncIcon className={sync.key === "checking" ? "spin" : undefined} size={14}/> Sync</span><strong>{sync.label}</strong><small>{refreshingDetail(sync.detail, sync.refreshing)}</small></div>
       </div>
       <div className="record-actions" aria-label={`Actions for ${project.name}`}>{actionError?.projectPath === project.canonicalPath && <div className="project-action-error" role="alert"><strong>{actionError.label} failed for {project.name}</strong><p>{actionError.message}</p><button onClick={onDismissActionError}>Dismiss</button></div>}<div className="primary-action"><ProjectActions project={project} githubAvailable={githubAvailable} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)} onModal={onModal}/></div><div className="record-utilities">{project.github.state === "linked" && project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={13}/></a>}<details><summary>Sync details</summary><p>{project.sync.detail}</p></details></div></div>
     </article>
@@ -207,6 +176,20 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
 }
 
 function Skeleton() { return <li className="project-row skeleton" aria-hidden="true"><div className="sk sk-wide"/><div className="sk"/><div className="sk sk-rail"/><div className="sk"/></li>; }
+
+function LedgerColumns({ sortKey, sortDirection, onSort }: { sortKey: SortKey; sortDirection: SortDirection; onSort: (key: SortKey) => void }) {
+  return <div className="ledger-columns" aria-label="Sortable project columns">
+    {(Object.keys(sortLabels) as SortKey[]).map((key) => {
+      const active = sortKey === key;
+      const nextDirection = active ? sortDirection === "asc" ? "descending" : "ascending" : key === "size" ? "descending" : "ascending";
+      const current = active ? `, sorted ${sortDirection === "asc" ? "ascending" : "descending"}` : "";
+      return <button key={key} type="button" data-sort-key={key} className={active ? "active" : ""} aria-pressed={active} aria-label={`${sortLabels[key]}${current}. Activate to sort ${nextDirection}.`} onClick={() => onSort(key)}>
+        <span>{sortLabels[key]}</span>{active && (sortDirection === "asc" ? <ArrowUp size={14} aria-hidden="true"/> : <ArrowDown size={14} aria-hidden="true"/>)}
+      </button>;
+    })}
+    <span className="action-column-label">Action</span>
+  </div>;
+}
 
 function RootPicker({ currentRoot, value, busy, error, onChange, onClose, onBrowse, onSave }: { currentRoot: string; value: string; busy: boolean; error: string | null; onChange: (value: string) => void; onClose: () => void; onBrowse: () => void; onSave: () => void }) {
   return <DialogFrame titleId="root-picker-title" busy={busy} onClose={onClose} className="root-picker"><p className="kicker">PROJECT SOURCE</p><h2 id="root-picker-title">Change parent folder</h2><p>Currently using <code>{currentRoot}</code>. Each direct child folder in the selected parent becomes one project.</p><label className="field"><span>Folder path</span><input value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && value.trim() && !busy) onSave(); }} placeholder="~/Documents"/><small>Use an absolute path or a path beginning with ~/.</small></label>{error && <p className="inline-error" role="alert">{error}</p>}<div className="dialog-actions split"><button className="button quiet" onClick={onBrowse} disabled={busy}><Folder size={15}/> Browse…</button><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="button primary" onClick={onSave} disabled={busy || !value.trim()}>{busy ? <LoaderCircle className="spin" size={15}/> : <Check size={15}/>} {busy ? "Changing…" : "Use this folder"}</button></div></DialogFrame>;
@@ -281,7 +264,17 @@ export function ProjectDashboard() {
   const allProjects = useMemo(() => data?.projects || [], [data?.projects]);
   const counts = useMemo(() => { const ignored = allProjects.filter((project) => project.preferences.ignored); const working = allProjects.filter((project) => !project.preferences.ignored); return { onDisk: allProjects.length, working: working.length, ignored: ignored.length, local: working.filter((project) => project.preferences.localOnly).length, attention: working.filter(needsAttention).length, bytes: allProjects.reduce((sum, project) => sum + (project.size.status === "complete" ? project.size.bytes : 0), 0) }; }, [allProjects]);
   const viewBase = useMemo(() => allProjects.filter((project) => projectInView(project, view)), [allProjects, view]);
-  const visible = useMemo(() => { const needle = query.trim().toLowerCase(); return viewBase.filter((project) => !needle || [project.name, project.description.text, project.description.sourceLabel, project.canonicalPath, project.pathLabel, ...project.technologies, gitView(project).label, gitView(project).detail, project.git.branch, githubView(project).label, githubView(project).detail, project.github.repository?.name, project.github.repository?.nameWithOwner, syncView(project.sync.state, project.sync.ahead, project.sync.behind).label, project.sync.detail].filter(Boolean).join(" ").toLowerCase().includes(needle)).sort((a, b) => compareProjects(a, b, sortKey, sortDirection)); }, [query, sortDirection, sortKey, viewBase]);
+  const visible = useMemo(() => { const needle = query.trim().toLowerCase(); return viewBase.filter((project) => !needle || projectSearchText(project).includes(needle)).sort((a, b) => compareProjects(a, b, sortKey, sortDirection)); }, [query, sortDirection, sortKey, viewBase]);
+  const sortFromHeader = useCallback((next: SortKey) => {
+    lensInteracted.current = true;
+    if (next === sortKey) setSortDirection((current) => current === "asc" ? "desc" : "asc");
+    else { setSortKey(next); setSortDirection(next === "size" ? "desc" : "asc"); }
+  }, [sortKey]);
+  const sortFromSelect = useCallback((next: SortKey) => {
+    lensInteracted.current = true;
+    if (next !== sortKey) setSortDirection(next === "size" ? "desc" : "asc");
+    setSortKey(next);
+  }, [sortKey]);
   const copy = async (project: ProjectRecord) => { setUtilityError(null); try { await navigator.clipboard.writeText(project.canonicalPath); setToast(`Absolute folder path copied for ${project.name}`); } catch { setUtilityError(`Couldn’t copy the absolute folder path for ${project.name}. Select it from the project record and copy it manually: ${project.canonicalPath}`); } };
   const openModal = useCallback((next: NonNullable<ModalState>) => { setActionError(null); setModal(next); }, []);
   const closeModal = useCallback(() => { if (!modal) return; const trigger = modal.trigger; setModal(null); requestAnimationFrame(() => trigger?.focus()); }, [modal]);
@@ -306,13 +299,13 @@ export function ProjectDashboard() {
     <section className="control-band" aria-label="Working-set controls">
       <label className="search-field"><Search size={16}/><span className="sr-only">Search projects</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name, description, source, path, technology, or state"/>{query && <button onClick={() => setQuery("")} aria-label="Clear search"><X size={15}/></button>}</label>
       <div className="view-tabs" role="group" aria-label="Project view">{(Object.keys(viewLabels) as ProjectView[]).map((item) => <button key={item} aria-pressed={view === item} onClick={() => { lensInteracted.current = true; setView(item); }}>{viewLabels[item]} <span>{data ? viewCounts[item] : "—"}</span></button>)}</div>
-      <div className="sort-controls" role="group" aria-label="Sort projects"><label><span>Sort</span><select value={sortKey} onChange={(event) => { lensInteracted.current = true; setSortKey(event.target.value as SortKey); }} aria-label="Sort projects by">{(Object.keys(sortLabels) as SortKey[]).map((item) => <option key={item} value={item}>{sortLabels[item]}</option>)}</select></label><button className="direction-button" onClick={() => { lensInteracted.current = true; setSortDirection((current) => current === "asc" ? "desc" : "asc"); }} aria-label={`${sortDirection === "asc" ? "Ascending" : "Descending"}, change sort direction`} aria-pressed={sortDirection === "desc"}>{sortDirection === "asc" ? <ArrowUp size={15}/> : <ArrowDown size={15}/>} {sortDirection === "asc" ? "Ascending" : "Descending"}</button></div>
+      <div className="sort-controls responsive-sort-controls" role="group" aria-label="Sort projects"><label><span>Sort</span><select value={sortKey} onChange={(event) => sortFromSelect(event.target.value as SortKey)} aria-label="Sort projects by">{(Object.keys(sortLabels) as SortKey[]).map((item) => <option key={item} value={item}>{sortLabels[item]}</option>)}</select></label><button className="direction-button" onClick={() => { lensInteracted.current = true; setSortDirection((current) => current === "asc" ? "desc" : "asc"); }} aria-label={`${sortDirection === "asc" ? "Ascending" : "Descending"}, change sort direction`} aria-pressed={sortDirection === "desc"}>{sortDirection === "asc" ? <ArrowUp size={15}/> : <ArrowDown size={15}/>} {sortDirection === "asc" ? "Ascending" : "Descending"}</button></div>
     </section>
     {scannerError && data && <div className="stale-banner" role="status"><AlertCircle size={16}/><div><strong>Local scanner unavailable</strong><span>Showing cached data from {new Date(data.scannedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Search, sorting, paths, and local intent remain available; repository facts may be stale.</span></div><button className="button secondary" onClick={() => void loadProjects(true, true)}>Retry</button></div>}
     {authCode && !githubAuth.connected && <div className="github-auth-banner" role="status"><Github size={17}/><div><strong>Finish connecting GitHub</strong><span>Enter code <code>{authCode}</code> on GitHub. Project Deck will update automatically after sign-in.</span></div><a className="button primary" href="https://github.com/login/device" target="_blank" rel="noreferrer">Open GitHub <ExternalLink size={14}/></a></div>}
     {authError && <div className="error-banner" role="alert"><AlertCircle size={16}/><span>{authError}</span><button className="icon-button" onClick={() => setAuthError(null)} aria-label="Dismiss GitHub connection error"><X size={15}/></button></div>}
     {utilityError && <div className="error-banner" role="alert"><AlertCircle size={16}/><span>{utilityError}</span><button className="icon-button" onClick={() => setUtilityError(null)} aria-label="Dismiss utility error"><X size={15}/></button></div>}
-    <section className="ledger" aria-busy={loading && !data}><header><div><p className="kicker">PROJECT LEDGER</p><h2>{!data ? `— in ${viewLabels[view]}` : query ? `${visible.length} of ${viewBase.length} in ${viewLabels[view]}` : `${viewBase.length} in ${viewLabels[view]}`}{data?.enriching ? <span> · checking detailed repository status</span> : null}</h2></div><div className="ledger-key" aria-hidden="true"><span>Identity</span><span>Facts</span><span>Git → GitHub → Sync</span><span>Action</span></div></header><ul className="project-list">{loading && !data ? Array.from({ length: 4 }, (_, index) => <Skeleton key={index}/>) : visible.map((project) => <ProjectRow key={project.canonicalPath} project={project} githubAvailable={Boolean(data?.github.available)} busy={busyProject === project.canonicalPath} actionError={actionError} onDismissActionError={() => setActionError(null)} onAction={(item, kind, trigger) => void action(item, kind, {}, trigger)} onCopy={(item) => void copy(item)} onModal={openModal}/>)}</ul>
+    <section className="ledger" aria-busy={loading && !data}><header><div><p className="kicker">PROJECT LEDGER</p><h2>{!data ? `— in ${viewLabels[view]}` : query ? `${visible.length} of ${viewBase.length} in ${viewLabels[view]}` : `${viewBase.length} in ${viewLabels[view]}`}{data?.enriching ? <span> · checking detailed repository status</span> : null}</h2></div><LedgerColumns sortKey={sortKey} sortDirection={sortDirection} onSort={sortFromHeader}/></header><ul className="project-list">{loading && !data ? Array.from({ length: 4 }, (_, index) => <Skeleton key={index}/>) : visible.map((project) => <ProjectRow key={project.canonicalPath} project={project} githubAvailable={Boolean(data?.github.available)} busy={busyProject === project.canonicalPath} actionError={actionError} onDismissActionError={() => setActionError(null)} onAction={(item, kind, trigger) => void action(item, kind, {}, trigger)} onCopy={(item) => void copy(item)} onModal={openModal}/>)}</ul>
     {!loading && !data && scannerError && <div className="state-surface" role="status"><AlertCircle/><p className="kicker">LOCAL SERVICE · OFFLINE</p><h3>Project Deck could not reach the local service</h3><p>{retryPending ? "Trying once more. This page will stay usable while Project Deck checks again." : retryExhausted ? "Restart Project Deck, then retry. No project files or settings were changed." : "The local project service did not respond."}</p><button className="button primary" onClick={() => void loadProjects(false, true)}><RefreshCw size={15}/> Retry now</button></div>}
     {!loading && data && emptyKind && <div className="state-surface"><Folder/><p className="kicker">{emptyKind === "root" ? "ROOT · EMPTY" : emptyKind === "ignored-only" ? "WORKING SET · EMPTY" : "VIEW · EMPTY"}</p><h3>{emptyKind === "root" ? "No project folders found" : emptyKind === "ignored-only" ? "Every project is ignored" : emptyKind === "query" ? `No matches in ${viewLabels[view]}` : `${viewLabels[view]} is empty`}</h3><p>{emptyKind === "root" ? `${data.rootLabel} is available, but it contains no direct child folders.` : emptyKind === "ignored-only" ? "Nothing was deleted. Your projects remain on disk and are available in Ignored." : emptyKind === "query" ? "Clear the search to return to this view without changing its sort or scope." : view === "ignored" ? "Ignored projects will appear here and can be restored." : "No projects currently meet this view’s rules."}</p>{emptyKind === "ignored-only" ? <button className="button primary" onClick={() => setView("ignored")}>Show ignored projects</button> : emptyKind === "query" ? <button className="button secondary" onClick={() => setQuery("")}>Clear search</button> : null}</div>}</section></div>
     <div className="sr-only" role="status" aria-live="polite">{refreshing ? "Refreshing project facts" : toast || ""}</div>{toast && <div className="toast" role="status"><Check size={15}/>{toast}</div>}

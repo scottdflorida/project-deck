@@ -10,10 +10,12 @@ actions in one place.
 - Descriptions from README/ABOUT/OVERVIEW files or project manifests, with the
   exact source shown beside each description
 - Total on-disk size for every project
-- Git status, current branch, recent activity, and working-tree changes
+- Git status, current branch, recent activity, and working-tree changes; slow or
+  iCloud-offloaded working trees are identified without hiding known Git facts
 - Exact-name GitHub matches and linked `origin` repositories
 - Ahead, behind, diverged, unpublished, and in-sync states
-- Sorting by name, size, Git, GitHub, or sync state in either direction
+- Clickable project, size, Git, GitHub, and sync column headers, with the same
+  sorting controls in a compact selector on smaller screens
 - Working set, needs-attention, local-only, and ignored views
 - Search and a responsive project ledger
 

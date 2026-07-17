@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -105,6 +105,107 @@ test("publishes local Git and remote facts before slower size enrichment", async
     if (previousGithubSetting === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = previousGithubSetting;
     if (previousNativeSize === undefined) delete process.env.GIT_SCAN_USE_NATIVE_SIZE; else process.env.GIT_SCAN_USE_NATIVE_SIZE = previousNativeSize;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("offloaded-file detection ignores unrelated placeholders and catches tracked paths", () => {
+  const projectPath = "/work/project";
+  const offloaded = `${projectPath}/ignored-preview.png\u0000${projectPath}/src/tracked.ts\u0000`;
+  assert.equal(includesTrackedOffloadedPath(projectPath, offloaded, "README.md\u0000src/tracked.ts\u0000"), true);
+  assert.equal(includesTrackedOffloadedPath(projectPath, `${projectPath}/ignored-preview.png\u0000`, "README.md\u0000src/tracked.ts\u0000"), false);
+});
+
+test("one slow Git worktree times out without corrupting a healthy repository", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-git-timeout-test-"));
+  const oldRoot = process.env.GIT_SCAN_ROOT;
+  const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  const oldTimeout = process.env.GIT_SCAN_STATUS_TIMEOUT_MS;
+  process.env.GIT_SCAN_ROOT = root;
+  process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  process.env.GIT_SCAN_STATUS_TIMEOUT_MS = "150";
+  try {
+    const healthy = path.join(root, "healthy");
+    const slow = path.join(root, "slow");
+    await Promise.all([mkdir(healthy), mkdir(slow)]);
+    for (const projectPath of [healthy, slow]) {
+      await writeFile(path.join(projectPath, "README.md"), `${path.basename(projectPath)}\n`);
+      execFileSync("git", ["init", "-b", "main"], { cwd: projectPath });
+      execFileSync("git", ["config", "user.name", "Project Deck Test"], { cwd: projectPath });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: projectPath });
+      execFileSync("git", ["add", "README.md"], { cwd: projectPath });
+      execFileSync("git", ["commit", "-m", "Initial fixture"], { cwd: projectPath });
+    }
+    const monitor = path.join(root, "slow-fsmonitor.sh");
+    await writeFile(monitor, "#!/bin/sh\nsleep 5\n");
+    await chmod(monitor, 0o755);
+    execFileSync("git", ["config", "core.fsmonitor", monitor], { cwd: slow });
+    await loadProjectsRoot();
+
+    const result = await scanProjects(false);
+    const healthyProject = result.projects.find((project) => project.name === "healthy");
+    const slowProject = result.projects.find((project) => project.name === "slow");
+    assert.equal(healthyProject?.git.statusAvailable, true);
+    assert.equal(healthyProject?.git.changeCount, 0);
+    assert.equal(slowProject?.git.statusAvailable, false);
+    assert.equal(slowProject?.git.statusReason, "timeout");
+    assert.equal(slowProject?.git.hasCommits, true);
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    if (oldTimeout === undefined) delete process.env.GIT_SCAN_STATUS_TIMEOUT_MS; else process.env.GIT_SCAN_STATUS_TIMEOUT_MS = oldTimeout;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sync comparison classifies local and remote refs reproducibly", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-sync-matrix-test-"));
+  const remote = path.join(temp, "remote.git");
+  const local = path.join(temp, "local");
+  const peer = path.join(temp, "peer");
+  try {
+    await mkdir(local);
+    execFileSync("git", ["init", "--bare", remote]);
+    execFileSync("git", ["init", "-b", "main"], { cwd: local });
+    execFileSync("git", ["config", "user.name", "Project Deck Test"], { cwd: local });
+    execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: local });
+    await writeFile(path.join(local, "README.md"), "initial\n");
+    execFileSync("git", ["add", "README.md"], { cwd: local });
+    execFileSync("git", ["commit", "-m", "Initial"], { cwd: local });
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: local });
+    execFileSync("git", ["push", "-u", "origin", "main"], { cwd: local });
+    assert.equal((await getSyncState(local, "main", true, true, false)).state, "in_sync");
+
+    await writeFile(path.join(local, "local.txt"), "ahead\n");
+    execFileSync("git", ["add", "local.txt"], { cwd: local });
+    execFileSync("git", ["commit", "-m", "Local ahead"], { cwd: local });
+    const ahead = await getSyncState(local, "main", true, true, false);
+    assert.deepEqual({ state: ahead.state, ahead: ahead.ahead, behind: ahead.behind }, { state: "ahead", ahead: 1, behind: 0 });
+
+    execFileSync("git", ["reset", "--hard", "origin/main"], { cwd: local });
+    execFileSync("git", ["clone", "-b", "main", remote, peer]);
+    execFileSync("git", ["config", "user.name", "Project Deck Test"], { cwd: peer });
+    execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: peer });
+    await writeFile(path.join(peer, "remote.txt"), "behind\n");
+    execFileSync("git", ["add", "remote.txt"], { cwd: peer });
+    execFileSync("git", ["commit", "-m", "Remote ahead"], { cwd: peer });
+    execFileSync("git", ["push", "origin", "main"], { cwd: peer });
+    execFileSync("git", ["fetch", "origin"], { cwd: local });
+    const behind = await getSyncState(local, "main", true, true, false);
+    assert.deepEqual({ state: behind.state, ahead: behind.ahead, behind: behind.behind }, { state: "behind", ahead: 0, behind: 1 });
+
+    await writeFile(path.join(local, "diverged.txt"), "diverged\n");
+    execFileSync("git", ["add", "diverged.txt"], { cwd: local });
+    execFileSync("git", ["commit", "-m", "Diverged local"], { cwd: local });
+    const diverged = await getSyncState(local, "main", true, true, false);
+    assert.deepEqual({ state: diverged.state, ahead: diverged.ahead, behind: diverged.behind }, { state: "diverged", ahead: 1, behind: 1 });
+
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: local });
+    assert.equal((await getSyncState(local, "feature", true, true, false)).state, "unpublished");
+    assert.equal((await getSyncState(local, "feature", false, true, false)).state, "no_commits");
+    assert.equal((await getSyncState(local, "feature", true, false, false)).state, "no_remote");
+    assert.equal((await getSyncState(local, null, true, true, false)).state, "unavailable");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 });
 
