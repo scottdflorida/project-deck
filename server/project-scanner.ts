@@ -1101,8 +1101,14 @@ export async function scanProjectsQuick(
     let gitExists = false;
     let branch: string | null = null;
     let origin = "";
-    if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0") {
-      gitExists = await exists(path.join(projectPath, ".git"));
+    let modifiedAt = fastNow;
+    if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0" || platform() === "win32") {
+      const [repositoryExists, projectStat] = await Promise.all([
+        exists(path.join(projectPath, ".git")),
+        stat(projectPath).catch(() => null),
+      ]);
+      gitExists = repositoryExists;
+      if (projectStat) modifiedAt = projectStat.mtime.toISOString();
       if (gitExists) {
         const [head, config] = await Promise.all([
           readFile(path.join(projectPath, ".git", "HEAD"), "utf8").catch(() => ""),
@@ -1113,14 +1119,22 @@ export async function scanProjectsQuick(
         origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim() || "";
       }
     } else {
-      const [repositoryResult, branchResult, originResult] = await Promise.all([
+      const modifiedCommand = platform() === "darwin"
+        ? ["stat", ["-f", "%m", projectPath]] as const
+        : ["stat", ["-c", "%Y", projectPath]] as const;
+      const [repositoryResult, branchResult, originResult, modifiedResult] = await Promise.all([
         run("git", ["rev-parse", "--is-inside-work-tree"], projectPath, 1_000),
         run("git", ["branch", "--show-current"], projectPath, 1_000),
         run("git", ["remote", "get-url", "origin"], projectPath, 1_000),
+        run(modifiedCommand[0], [...modifiedCommand[1]], root, 1_000),
       ]);
       gitExists = repositoryResult.ok && repositoryResult.stdout === "true";
       branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : null;
       origin = originResult.ok ? originResult.stdout : "";
+      const modifiedSeconds = Number.parseInt(modifiedResult.stdout, 10);
+      if (modifiedResult.ok && Number.isSafeInteger(modifiedSeconds)) {
+        modifiedAt = new Date(modifiedSeconds * 1_000).toISOString();
+      }
     }
     let linkedRepository: GithubRepository | null = null;
     if (gitExists && origin) {
@@ -1137,7 +1151,7 @@ export async function scanProjectsQuick(
       summary: "",
       preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies: [],
-      modifiedAt: fastNow,
+      modifiedAt,
       size: { ...SIZE_ERROR },
       git: { isRepository: gitExists, branch, hasCommits: gitExists, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
       github: { state: linkedRepository ? "linked" as const : "unavailable" as const, repository: linkedRepository },
