@@ -81,8 +81,9 @@ test("publishes local Git and remote facts before slower size enrichment", async
 
   try {
     const alpha = path.join(root, "alpha");
-    await mkdir(path.join(alpha, ".git"), { recursive: true });
+    await mkdir(path.join(alpha, ".git", "refs", "heads"), { recursive: true });
     await writeFile(path.join(alpha, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(path.join(alpha, ".git", "refs", "heads", "main"), `${"a".repeat(40)}\n`);
     await writeFile(path.join(alpha, ".git", "config"), '[remote "origin"]\n\turl = https://github.com/example/alpha.git\n');
     await writeFile(path.join(alpha, "README.md"), "Alpha is a useful local project with a linked GitHub repository.\n");
     await loadProjectsRoot();
@@ -94,6 +95,7 @@ test("publishes local Git and remote facts before slower size enrichment", async
 
     assert.equal(staged?.git.isRepository, true);
     assert.equal(staged?.git.branch, "main");
+    assert.equal(staged?.git.hasCommits, true);
     assert.equal(staged?.github.state, "linked");
     assert.equal(staged?.transient?.size, "checking");
     assert.equal(completed.projects[0].size.status, "complete");

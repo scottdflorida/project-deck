@@ -93,6 +93,21 @@ type CommandResult = {
   exitCode: number | null;
 };
 
+type LocalGitMetadata = {
+  isRepository: boolean;
+  branch: string | null;
+  hasCommits: boolean;
+  origin: string;
+};
+
+const EMPTY_LOCAL_GIT: LocalGitMetadata = {
+  isRepository: false,
+  branch: null,
+  hasCommits: false,
+  origin: "",
+};
+const GIT_OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/iu;
+
 type GithubContext = {
   available: boolean;
   login: string | null;
@@ -366,6 +381,118 @@ async function run(
         typeof commandError.code === "number" ? commandError.code : null,
     };
   }
+}
+
+function gitHeadFacts(contents: string) {
+  const head = contents.trim();
+  if (GIT_OBJECT_ID.test(head)) {
+    return { branch: null, ref: null, hasCommits: true };
+  }
+  const ref = head.match(/^ref:\s+(.+)$/u)?.[1] || null;
+  return {
+    branch: ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null,
+    ref,
+    hasCommits: false,
+  };
+}
+
+function originFromGitConfig(contents: string) {
+  return contents.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim() || "";
+}
+
+function packedRefsContain(contents: string, ref: string) {
+  return contents.split("\n").some((line) => {
+    const [objectId, name] = line.trim().split(/\s+/u, 2);
+    return name === ref && GIT_OBJECT_ID.test(objectId || "");
+  });
+}
+
+function resolveGitMetadataPath(base: string, value: string) {
+  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(base, value);
+}
+
+/**
+ * Read the tiny files that define repository identity without starting Git.
+ * Large project inventories can otherwise launch hundreds of Git processes at
+ * once, and a slow or cloud-offloaded repository gets misreported when those
+ * processes hit their deadline. Command reads are bounded on Unix; Windows
+ * uses the equivalent filesystem representation.
+ */
+async function readLocalGitMetadata(root: string, projectPath: string): Promise<LocalGitMetadata> {
+  const dotGitPath = path.join(projectPath, ".git");
+
+  if (platform() !== "win32") {
+    const dotGitListing = await run("ls", ["-ld", dotGitPath], root, 800);
+    if (!dotGitListing.ok) return { ...EMPTY_LOCAL_GIT };
+
+    let gitDir = dotGitPath;
+    if (!dotGitListing.stdout.startsWith("d")) {
+      const pointer = await run("head", ["-c", "4096", dotGitPath], root, 1_200);
+      const target = pointer.stdout.match(/^gitdir:\s*(.+)$/imu)?.[1]?.trim();
+      if (!pointer.ok || !target) return { ...EMPTY_LOCAL_GIT };
+      gitDir = resolveGitMetadataPath(projectPath, target);
+    }
+
+    const [headResult, commonDirResult] = await Promise.all([
+      run("head", ["-c", "4096", path.join(gitDir, "HEAD")], root, 1_200),
+      run("head", ["-c", "4096", path.join(gitDir, "commondir")], root, 1_200),
+    ]);
+    const commonDir = commonDirResult.ok && commonDirResult.stdout
+      ? resolveGitMetadataPath(gitDir, commonDirResult.stdout)
+      : gitDir;
+    const head = headResult.ok ? gitHeadFacts(headResult.stdout) : { branch: null, ref: null, hasCommits: false };
+    const [configResult, refResult, packedRefsResult] = await Promise.all([
+      run("head", ["-c", "65536", path.join(commonDir, "config")], root, 1_200),
+      head.ref
+        ? run("head", ["-c", "128", path.join(commonDir, head.ref)], root, 1_200)
+        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null } satisfies CommandResult),
+      head.ref
+        ? run("head", ["-c", "1048576", path.join(commonDir, "packed-refs")], root, 1_200)
+        : Promise.resolve({ ok: false, stdout: "", stderr: "", exitCode: null } satisfies CommandResult),
+    ]);
+    const hasCommits = head.hasCommits
+      || GIT_OBJECT_ID.test(refResult.stdout)
+      || Boolean(head.ref && packedRefsResult.ok && packedRefsContain(packedRefsResult.stdout, head.ref));
+    return {
+      isRepository: true,
+      branch: head.branch,
+      hasCommits,
+      origin: configResult.ok ? originFromGitConfig(configResult.stdout) : "",
+    };
+  }
+
+  let dotGitStat;
+  try {
+    dotGitStat = await lstat(dotGitPath);
+  } catch {
+    return { ...EMPTY_LOCAL_GIT };
+  }
+  let gitDir = dotGitPath;
+  if (!dotGitStat.isDirectory()) {
+    const pointer = await readFile(dotGitPath, "utf8").catch(() => "");
+    const target = pointer.match(/^gitdir:\s*(.+)$/imu)?.[1]?.trim();
+    if (!target) return { ...EMPTY_LOCAL_GIT };
+    gitDir = resolveGitMetadataPath(projectPath, target);
+  }
+  const commonDirValue = await readFile(path.join(gitDir, "commondir"), "utf8").catch(() => "");
+  const commonDir = commonDirValue.trim()
+    ? resolveGitMetadataPath(gitDir, commonDirValue.trim())
+    : gitDir;
+  const [headContents, configContents] = await Promise.all([
+    readFile(path.join(gitDir, "HEAD"), "utf8").catch(() => ""),
+    readFile(path.join(commonDir, "config"), "utf8").catch(() => ""),
+  ]);
+  const head = gitHeadFacts(headContents);
+  const [refContents, packedRefsContents] = await Promise.all([
+    head.ref ? readFile(path.join(commonDir, head.ref), "utf8").catch(() => "") : "",
+    head.ref ? readFile(path.join(commonDir, "packed-refs"), "utf8").catch(() => "") : "",
+  ]);
+  return {
+    isRepository: true,
+    branch: head.branch,
+    hasCommits: head.hasCommits || GIT_OBJECT_ID.test(refContents.trim()) || Boolean(head.ref && packedRefsContain(packedRefsContents, head.ref)),
+    origin: originFromGitConfig(configContents),
+  };
 }
 
 /**
@@ -864,16 +991,17 @@ async function scanProject(
 ): Promise<ProjectRecord> {
   const projectPath = path.join(root, name);
   const canonicalPath = await canonicalizeProjectPath(projectPath);
-  const [entries, projectStat, size] = await Promise.all([
+  const [entries, projectStat, size, gitMetadata] = await Promise.all([
     readdir(projectPath, { withFileTypes: true }).catch(() => []),
     stat(projectPath),
     measureProjectSizeForScan(projectPath, root),
+    readLocalGitMetadata(root, projectPath),
   ]);
   const names = entries.map((entry) => entry.name);
   const projectPreference = preferenceFor(canonicalPath);
   const description = await discoverProjectDescription(projectPath, names, projectPreference.description);
   const technologies = detectTechnologies(names);
-  const isRepository = await exists(path.join(projectPath, ".git"));
+  const isRepository = gitMetadata.isRepository;
 
   if (!isRepository) {
     const matchedRepository = github.byName.get(name.toLowerCase()) || null;
@@ -928,12 +1056,12 @@ async function scanProject(
       ),
     ]);
 
-  const branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : null;
-  const hasCommits = headResult.ok;
+  const branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : gitMetadata.branch;
+  const hasCommits = headResult.ok || gitMetadata.hasCommits;
   const changeCount = statusResult.ok && statusResult.stdout
     ? statusResult.stdout.split("\n").filter(Boolean).length
     : 0;
-  const remote = originResult.ok ? parseGithubRemote(originResult.stdout) : null;
+  const remote = parseGithubRemote(originResult.ok ? originResult.stdout : gitMetadata.origin);
   const matched = github.byName.get(name.toLowerCase()) || null;
   const knownLinked = remote
     ? github.byFullName.get(remote.nameWithOwner.toLowerCase()) || null
@@ -1019,7 +1147,7 @@ export async function scanProjects(refreshRemote = false): Promise<ProjectScanRe
     .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
   // Most work is independent filesystem/process I/O. A wider bounded pool keeps
   // a large Documents directory responsive while slow folders time out alone.
-  const projects = await mapWithConcurrency(folderNames, 32, (name) =>
+  const projects = await mapWithConcurrency(folderNames, 8, (name) =>
     scanProject(root, name, github, refreshRemote),
   );
 
@@ -1096,49 +1224,27 @@ export async function scanProjectsQuick(
 
   const githubPromise = getGithubContext(root);
   const fastNow = new Date().toISOString();
-  const fastProjects = await mapWithConcurrency(folderNames, 12, async (name) => {
+  const fastProjects = await mapWithConcurrency(folderNames, 8, async (name) => {
     const projectPath = path.join(root, name);
-    let gitExists = false;
-    let branch: string | null = null;
-    let origin = "";
+    const gitMetadataPromise = readLocalGitMetadata(root, projectPath);
     let modifiedAt = fastNow;
-    if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0" || platform() === "win32") {
-      const [repositoryExists, projectStat] = await Promise.all([
-        exists(path.join(projectPath, ".git")),
-        stat(projectPath).catch(() => null),
-      ]);
-      gitExists = repositoryExists;
+    if (platform() === "win32") {
+      const projectStat = await stat(projectPath).catch(() => null);
       if (projectStat) modifiedAt = projectStat.mtime.toISOString();
-      if (gitExists) {
-        const [head, config] = await Promise.all([
-          readFile(path.join(projectPath, ".git", "HEAD"), "utf8").catch(() => ""),
-          readFile(path.join(projectPath, ".git", "config"), "utf8").catch(() => ""),
-        ]);
-        const trimmedHead = head.trim();
-        branch = trimmedHead.startsWith("ref: refs/heads/") ? trimmedHead.slice("ref: refs/heads/".length) : null;
-        origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim() || "";
-      }
     } else {
       const modifiedCommand = platform() === "darwin"
         ? ["stat", ["-f", "%m", projectPath]] as const
         : ["stat", ["-c", "%Y", projectPath]] as const;
-      const [repositoryResult, branchResult, originResult, modifiedResult] = await Promise.all([
-        run("git", ["rev-parse", "--is-inside-work-tree"], projectPath, 1_000),
-        run("git", ["branch", "--show-current"], projectPath, 1_000),
-        run("git", ["remote", "get-url", "origin"], projectPath, 1_000),
-        run(modifiedCommand[0], [...modifiedCommand[1]], root, 1_000),
-      ]);
-      gitExists = repositoryResult.ok && repositoryResult.stdout === "true";
-      branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : null;
-      origin = originResult.ok ? originResult.stdout : "";
+      const modifiedResult = await run(modifiedCommand[0], [...modifiedCommand[1]], root, 1_000);
       const modifiedSeconds = Number.parseInt(modifiedResult.stdout, 10);
       if (modifiedResult.ok && Number.isSafeInteger(modifiedSeconds)) {
         modifiedAt = new Date(modifiedSeconds * 1_000).toISOString();
       }
     }
+    const gitMetadata = await gitMetadataPromise;
     let linkedRepository: GithubRepository | null = null;
-    if (gitExists && origin) {
-      const parsed = parseGithubRemote(origin);
+    if (gitMetadata.isRepository && gitMetadata.origin) {
+      const parsed = parseGithubRemote(gitMetadata.origin);
       if (parsed) linkedRepository = { name: parsed.repo, nameWithOwner: parsed.nameWithOwner, url: parsed.url, isPrivate: null };
     }
     const projectPreference = preferenceFor(projectPath);
@@ -1153,10 +1259,18 @@ export async function scanProjectsQuick(
       technologies: [],
       modifiedAt,
       size: { ...SIZE_ERROR },
-      git: { isRepository: gitExists, branch, hasCommits: gitExists, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+      git: {
+        isRepository: gitMetadata.isRepository,
+        branch: gitMetadata.branch,
+        hasCommits: gitMetadata.hasCommits,
+        changeCount: 0,
+        statusAvailable: false,
+        lastCommitAt: null,
+        lastCommitMessage: null,
+      },
       github: { state: linkedRepository ? "linked" as const : "unavailable" as const, repository: linkedRepository },
       sync: { state: linkedRepository ? "unavailable" as const : "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: linkedRepository ? "The GitHub remote is linked; detailed sync status is still being checked." : "No GitHub remote is linked." },
-      transient: { size: "checking" as const, ...(gitExists ? { git: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
+      transient: { size: "checking" as const, ...(gitMetadata.isRepository ? { git: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
     } satisfies ProjectRecord;
   });
   onFacts?.({ rootPath: root, rootLabel: rootLabel(root), scannedAt: fastNow, enriching: true, github: { available: false, login: null }, projects: fastProjects });
@@ -1199,7 +1313,7 @@ export async function scanProjectsQuick(
   };
   onFacts?.(githubResponse);
 
-  const projects = await mapWithConcurrency(githubProjects, 12, async (project) => {
+  const projects = await mapWithConcurrency(githubProjects, 8, async (project) => {
     const projectPath = path.join(root, project.name);
     const names = platform() === "win32"
       ? (await settleWithin(

@@ -60,11 +60,57 @@ async function getProjectScan(refreshRemote: boolean) {
     return scanCache.value;
   }
 
-  const generation = scanGeneration;
-  if (refreshRemote) return startDeepScan(true, generation);
+  if (refreshRemote) {
+    clearGithubContextCache();
+    invalidateScanCaches(true);
+    const generation = scanGeneration;
+    if (quickScanCache) {
+      quickScanCache = {
+        ...quickScanCache,
+        scannedAt: new Date().toISOString(),
+        enriching: true,
+        projects: quickScanCache.projects.map((project) => ({
+          ...project,
+          transient: {
+            ...project.transient,
+            git: "checking",
+            github: "checking",
+            sync: "checking",
+          },
+        })),
+      };
+      void startQuickSizeScan(generation, quickScanCache, true);
+      return quickScanCache;
+    }
+    return startQuickScan(generation);
+  }
 
+  const generation = scanGeneration;
   if (quickScanCache) return quickScanCache;
   return startQuickScan(generation);
+}
+
+function startQuickSizeScan(generation: number, fallback: ScanResult, refreshRemote = false) {
+  if (quickSizeScanInFlight) return quickSizeScanInFlight;
+  const sizeScan = scanProjectsQuick(true, (factsValue) => {
+    if (generation === scanGeneration) quickScanCache = factsValue;
+  })
+    .then((sizedValue) => {
+      if (generation === scanGeneration) {
+        quickScanCache = sizedValue;
+        void startDeepScan(refreshRemote, generation).catch(() => undefined);
+      }
+      return sizedValue;
+    })
+    .catch(() => {
+      if (generation === scanGeneration) void startDeepScan(refreshRemote, generation).catch(() => undefined);
+      return fallback;
+    });
+  quickSizeScanInFlight = sizeScan;
+  void sizeScan.finally(() => {
+    if (quickSizeScanInFlight === sizeScan) quickSizeScanInFlight = null;
+  });
+  return sizeScan;
 }
 
 function startQuickScan(generation = scanGeneration) {
@@ -74,27 +120,7 @@ function startQuickScan(generation = scanGeneration) {
     if (generation !== scanGeneration) return value;
     if (generation === scanGeneration) quickScanCache = value;
     if (quickSizeScanInFlight) return value;
-
-    const sizeScan = scanProjectsQuick(true, (factsValue) => {
-      if (generation === scanGeneration) {
-        quickScanCache = factsValue;
-      }
-    })
-      .then((sizedValue) => {
-        if (generation === scanGeneration) {
-          quickScanCache = sizedValue;
-          void startDeepScan(false, generation).catch(() => undefined);
-        }
-        return sizedValue;
-      })
-      .catch(() => {
-        if (generation === scanGeneration) void startDeepScan(false, generation).catch(() => undefined);
-        return value;
-      });
-    quickSizeScanInFlight = sizeScan;
-    void sizeScan.finally(() => {
-      if (quickSizeScanInFlight === sizeScan) quickSizeScanInFlight = null;
-    });
+    void startQuickSizeScan(generation, value);
     return value;
   });
   quickScanInFlight = initialScan;

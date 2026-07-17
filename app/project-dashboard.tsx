@@ -54,8 +54,8 @@ function gitView(project: ProjectRecord) {
     ? { label: "Repository found", detail: `${project.git.branch || "Branch unknown"} · checking changes`, tone: "checking" }
     : { label: "Checking…", detail: "Reading local Git metadata", tone: "checking" };
   if (!project.git.isRepository) return { label: "Not initialized", detail: "Local folder", tone: "neutral" };
-  if (!project.git.hasCommits) return { label: "Repository, no commits", detail: project.git.branch || "No branch yet", tone: "warn" };
   if (!project.git.statusAvailable) return { label: "Status unavailable", detail: project.git.branch || "Repository", tone: "unavailable" };
+  if (!project.git.hasCommits) return { label: "Repository, no commits", detail: project.git.branch || "No branch yet", tone: "warn" };
   if (project.git.changeCount) return { label: `${project.git.changeCount} local ${project.git.changeCount === 1 ? "change" : "changes"}`, detail: project.git.branch || "Detached HEAD", tone: "warn" };
   return { label: "Repository, clean", detail: project.git.branch || "Detached HEAD", tone: "good" };
 }
