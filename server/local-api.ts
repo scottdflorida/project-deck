@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { ActionResponse } from "../lib/project-types";
+import type { ActionResponse, ProjectRecord, ProjectRecordPatch } from "../lib/project-types";
 import {
   commitAndPushProject,
   chooseProjectsRoot,
@@ -13,6 +13,7 @@ import {
   getProjectsRoot,
   openProjectsRoot,
   pullProject,
+  reconnectProjectHistory,
   scanProjectsProgressively,
   scanProjectsQuick,
   setProjectsRoot,
@@ -37,6 +38,25 @@ function invalidateScanCaches(preserveQuick = false) {
   if (!preserveQuick) quickScanCache = null;
   quickScanInFlight = null;
   quickSizeScanInFlight = null;
+}
+
+function applyProjectPatch(value: ScanResult | null, patch: ProjectRecordPatch) {
+  if (!value) return value;
+  return {
+    ...value,
+    projects: value.projects.map((project) => project.canonicalPath === patch.canonicalPath
+      ? {
+          ...project,
+          preferences: patch.preferences,
+          ...(patch.description ? { description: patch.description, summary: patch.description.compact } : {}),
+        }
+      : project),
+  };
+}
+
+function applyProjectPatchToCaches(patch: ProjectRecordPatch) {
+  quickScanCache = applyProjectPatch(quickScanCache, patch);
+  if (scanCache) scanCache = { ...scanCache, value: applyProjectPatch(scanCache.value, patch)! };
 }
 
 async function getProjectScan(refreshRemote: boolean) {
@@ -147,7 +167,7 @@ async function readBody(request: IncomingMessage) {
 
 function routeParts(url: URL) {
   const match = url.pathname.match(
-    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|pull|push|preferences)$/u,
+    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|pull|push|reconnect|preferences)$/u,
   );
   if (!match) return null;
   try {
@@ -240,7 +260,7 @@ const server = createServer(async (request, response) => {
     const route = routeParts(url);
     if (request.method === "POST" && route) {
       const body = await readBody(request);
-      let result: Omit<ActionResponse, "ok">;
+      let result: { message: string; project: ProjectRecord };
 
       switch (route.action) {
         case "init":
@@ -263,15 +283,21 @@ const server = createServer(async (request, response) => {
         case "pull":
           result = await pullProject(route.name);
           break;
-        case "preferences":
-          result = await setProjectPreferences(route.name, {
+        case "reconnect":
+          result = await reconnectProjectHistory(route.name);
+          break;
+        case "preferences": {
+          const preferenceResult = await setProjectPreferences(route.name, {
             ignored: typeof body.ignored === "boolean" ? body.ignored : undefined,
             localOnly: typeof body.localOnly === "boolean" ? body.localOnly : undefined,
             description: body.description === null || typeof body.description === "string"
               ? body.description
               : undefined,
           });
-          break;
+          applyProjectPatchToCaches(preferenceResult.patch);
+          sendJson(response, 200, { ok: true, ...preferenceResult } satisfies ActionResponse);
+          return;
+        }
         default:
           throw new ProjectActionError("Unknown action.", 404);
       }

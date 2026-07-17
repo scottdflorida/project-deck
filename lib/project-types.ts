@@ -15,6 +15,9 @@ export interface GithubRepository {
   nameWithOwner: string;
   url: string;
   isPrivate: boolean | null;
+  /** GitHub's authoritative repository-history signal. Repository creation and
+   * metadata updates can change pushedAt even when no commit exists. */
+  isEmpty?: boolean | null;
   /** Most recent Git push reported by GitHub. This remains useful when the
    * selected local folder has missing or disconnected Git metadata. */
   pushedAt?: string | null;
@@ -108,11 +111,19 @@ export interface UnchangedRootResponse {
 
 export type RootSelectionResponse = ProjectScanResponse | UnchangedRootResponse;
 
-export interface ActionResponse {
+export interface ProjectRecordPatch {
+  canonicalPath: string;
+  preferences: ProjectPreferences;
+  description?: ProjectDescription;
+}
+
+export type ActionResponse = {
   ok: true;
   message: string;
-  project: ProjectRecord;
-}
+} & (
+  | { project: ProjectRecord; patch?: never }
+  | { project?: never; patch: ProjectRecordPatch }
+);
 
 export interface ActionFailureResponse {
   ok: false;

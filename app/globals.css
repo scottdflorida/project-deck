@@ -102,7 +102,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .ledger > header { display: grid; grid-template-columns: 1fr; gap: 13px; align-items: end; min-height: 82px; padding: 15px 12px 10px; }
 .ledger > header h2 { margin: 0; font-size: 15px; font-weight: 520; letter-spacing: -.02em; }
 .ledger > header h2 span { color: var(--muted); font-weight: 400; }
-.ledger-columns { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: stretch; border-top: 1px solid var(--line); }
+.ledger-columns { display: grid; grid-template-columns: minmax(300px, 1.65fr) minmax(90px, .42fr) minmax(125px, .58fr) minmax(145px, .72fr) minmax(155px, .78fr) minmax(180px, .9fr); gap: 14px; align-items: stretch; border-top: 1px solid var(--line); }
 .ledger-columns button { min-width: 0; min-height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--faint); font: 9px var(--font-geist-mono), monospace; letter-spacing: .09em; text-align: left; text-transform: uppercase; transition: background 140ms ease, border-color 140ms ease, color 140ms ease; }
 .ledger-columns button:hover { background: var(--surface); color: var(--ink-2); }
 .ledger-columns button.active { border-bottom-color: var(--accent); background: var(--accent-wash); color: var(--accent-dark); }
@@ -111,7 +111,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .project-list { list-style: none; margin: 0; padding: 0; }
 .project-row { border-top: 1px solid var(--line); }
 .project-row:last-child { border-bottom: 1px solid var(--line); }
-.project-record { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: start; padding: 18px 12px 19px; background: rgba(251,251,249,.48); transition: background 150ms ease; }
+.project-record { display: grid; grid-template-columns: minmax(300px, 1.65fr) minmax(90px, .42fr) minmax(125px, .58fr) minmax(145px, .72fr) minmax(155px, .78fr) minmax(180px, .9fr); gap: 14px; align-items: start; padding: 18px 12px 19px; background: rgba(251,251,249,.48); transition: background 150ms ease; }
 .project-record:hover { background: var(--surface); }
 .project-identity { min-width: 0; }
 .identity-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr) 40px; gap: 11px; align-items: start; }
@@ -143,7 +143,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .working-set-preference button:hover:not(:disabled), .rail-preference-button:hover:not(:disabled) { border-color: var(--ink-2); background: var(--surface-strong); color: var(--ink-2); }
 .working-set-preference button.active, .rail-preference-button.active { border-color: #9ba9d8; background: var(--accent-wash); color: var(--accent-dark); }
 
-.project-facts { display: grid; gap: 13px; padding-top: 2px; }
+.project-facts { display: grid; align-content: start; gap: 5px; padding-top: 2px; }
 .project-facts > div:not(.technology-list) { display: grid; gap: 5px; }
 .project-facts span, .project-facts .technology-list { color: var(--faint); font: 9px var(--font-geist-mono), monospace; letter-spacing: .04em; text-transform: uppercase; }
 .project-facts strong { font: 500 18px/1 var(--font-geist-mono), monospace; letter-spacing: -.045em; }
@@ -152,7 +152,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .project-facts .technology-list { line-height: 1.45; }
 .attention-reason { margin: 0; color: var(--warn); font-size: 10px; line-height: 1.35; }
 
-.repository-rail { position: relative; grid-column: 3 / 6; display: grid; grid-template-columns: subgrid; min-width: 0; }
+.repository-rail { position: relative; grid-column: 4 / 7; display: grid; grid-template-columns: subgrid; min-width: 0; }
 .repository-rail::before { content: ""; position: absolute; top: 17px; left: 17px; right: 17px; height: 1px; background: var(--line-strong); }
 .rail-stop { position: relative; min-width: 0; padding: 27px 12px 0; border-left: 1px solid var(--line); }
 .rail-stop:first-child { border-left: 0; padding-left: 0; }
@@ -167,7 +167,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .rail-stop.checking::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
 .rail-stop > span { display: flex; align-items: center; gap: 5px; color: var(--faint); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
 .rail-stop strong { display: block; margin-top: 8px; overflow-wrap: anywhere; color: var(--ink-2); font-size: 11px; line-height: 1.25; font-weight: 560; }
-.rail-stop small { display: -webkit-box; margin-top: 4px; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--faint); font-size: 9px; line-height: 1.35; }
+.rail-stop small { display: block; margin-top: 4px; color: var(--faint); font-size: 9px; line-height: 1.35; }
 .rail-stop.good > span { color: var(--good); }
 .rail-stop.warn > span { color: var(--warn); }
 .rail-stop.bad > span { color: var(--bad); }
@@ -196,10 +196,10 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .status-evidence dt { color: var(--faint); font: 8px var(--font-geist-mono), monospace; letter-spacing: .06em; text-transform: uppercase; }
 .status-evidence dd { margin: 0; color: var(--ink-2); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
 
-.skeleton { min-height: 144px; display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: center; padding: 18px 12px; }
+.skeleton { min-height: 144px; display: grid; grid-template-columns: minmax(300px, 1.65fr) minmax(90px, .42fr) minmax(125px, .58fr) minmax(145px, .72fr) minmax(155px, .78fr) minmax(180px, .9fr); gap: 14px; align-items: center; padding: 18px 12px; }
 .sk { height: 22px; border-radius: 3px; background: #e3e2dd; animation: pulse 1.5s ease-in-out infinite; }
 .sk-wide { height: 68px; }
-.sk-rail { grid-column: 3 / 6; height: 54px; }
+.sk-rail { grid-column: 4 / 7; height: 54px; }
 .state-surface { min-height: 300px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 42px 20px; border-block: 1px solid var(--line); background: var(--surface); text-align: center; }
 .state-surface > svg { width: 28px; height: 28px; margin-bottom: 20px; stroke-width: 1.3; }
 .state-surface h3 { margin: 0; font-size: 25px; font-weight: 450; letter-spacing: -.04em; }
@@ -249,9 +249,9 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
   .control-band { grid-template-columns: minmax(260px, 1fr) auto; }
   .responsive-sort-controls { grid-column: 1 / 3; display: flex; justify-content: flex-end; }
   .ledger-columns { display: none; }
-  .project-record { grid-template-columns: minmax(330px, 1fr) 150px; }
-  .repository-rail { grid-column: 1 / 3; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .skeleton { grid-template-columns: 1fr 150px; }
+  .project-record { grid-template-columns: minmax(330px, 1fr) 120px 145px; }
+  .repository-rail { grid-column: 1 / 4; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .skeleton { grid-template-columns: 1fr 120px 145px; }
   .sk-rail { grid-column: 1; }
 }
 
@@ -282,10 +282,10 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
   .sort-controls select { flex: 1; }
   .ledger { margin-top: 16px; }
   .ledger > header { min-height: 60px; padding-inline: 4px; }
-  .project-record { display: grid; grid-template-columns: 1fr; gap: 17px; padding: 18px 4px 21px; }
-  .project-facts { grid-template-columns: 1fr 1fr; padding-left: 45px; }
-  .project-facts .technology-list, .attention-reason { grid-column: 1 / 3; }
-  .repository-rail { grid-column: 1; }
+  .project-record { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; padding: 18px 4px 21px; }
+  .project-identity, .repository-rail, .row-action-error { grid-column: 1 / 3; }
+  .project-facts { padding-left: 45px; }
+  .project-activity { padding-left: 0; }
   .rail-stop { min-height: 102px; padding-inline: 8px; }
   .rail-stop:first-child { padding-left: 0; }
   .rail-stop small { -webkit-line-clamp: 3; }

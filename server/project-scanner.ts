@@ -1087,7 +1087,7 @@ async function loadGithubContext(root: string): Promise<GithubContext> {
       "--limit",
       "1000",
       "--json",
-      "name,nameWithOwner,url,isPrivate,pushedAt",
+      "name,nameWithOwner,url,isPrivate,isEmpty,pushedAt",
     ],
     root,
     8_000,
@@ -1232,7 +1232,7 @@ async function scanProject(
 
   if (!isRepository) {
     const matchedRepository = github.byName.get(name.toLowerCase()) || null;
-    const latestFileAt = !matchedRepository?.pushedAt && !options.skipFileActivity
+    const latestFileAt = (!matchedRepository?.pushedAt || matchedRepository.isEmpty === true) && !options.skipFileActivity
       ? await findLatestProjectFileAtForScan(projectPath, root)
       : null;
     return {
@@ -1299,6 +1299,7 @@ async function scanProject(
         nameWithOwner: remote.nameWithOwner,
         url: remote.url,
         isPrivate: null,
+        isEmpty: null,
       }
     : null;
   const lastCommitParts = lastCommitResult.ok
@@ -1313,7 +1314,7 @@ async function scanProject(
     gitMetadata,
   );
   const repository = linkedRepository || matched;
-  const latestFileAt = !lastCommitParts[0] && !repository?.pushedAt && !options.skipFileActivity
+  const latestFileAt = !lastCommitParts[0] && (!repository?.pushedAt || repository.isEmpty === true) && !options.skipFileActivity
     ? await findLatestProjectFileAtForScan(projectPath, root)
     : null;
 
@@ -1428,7 +1429,7 @@ export async function scanProjectsProgressively(
   const projects: ProjectRecord[] = folderNames.map((name): ProjectRecord => {
     const existing = previousByName.get(name);
     if (existing) {
-      const activityPending = !existing.git.lastCommitAt && !existing.github.repository?.pushedAt;
+      const activityPending = !existing.git.lastCommitAt && (!existing.github.repository?.pushedAt || existing.github.repository.isEmpty === true);
       return {
         ...existing,
         transient: {
@@ -1579,7 +1580,7 @@ export async function scanProjectsProgressively(
   const activityWork = mapWithConcurrency(indexed, 8, async ({ name, index }) => {
     await factReady[index].promise;
     const facts = projects[index];
-    const hasGitActivity = Boolean(facts.git.lastCommitAt || facts.github.repository?.pushedAt);
+    const hasGitActivity = Boolean(facts.git.lastCommitAt || (facts.github.repository?.isEmpty !== true && facts.github.repository?.pushedAt));
     const latestFileAt = hasGitActivity
       ? facts.latestFileAt ?? null
       : await findLatestProjectFileAtForScan(path.join(root, name), root);
@@ -1685,7 +1686,7 @@ export async function scanProjectsQuick(
     let linkedRepository: GithubRepository | null = null;
     if (gitMetadata.isRepository && gitMetadata.origin) {
       const parsed = parseGithubRemote(gitMetadata.origin);
-      if (parsed) linkedRepository = { name: parsed.repo, nameWithOwner: parsed.nameWithOwner, url: parsed.url, isPrivate: null };
+      if (parsed) linkedRepository = { name: parsed.repo, nameWithOwner: parsed.nameWithOwner, url: parsed.url, isPrivate: null, isEmpty: null };
     }
     const projectPreference = preferenceFor(projectPath);
     const description: ProjectDescription = { text: "", compact: "", source: "checking", sourceLabel: "Checking local description…", sourceFile: null };
@@ -1838,7 +1839,7 @@ export async function setProjectPreferences(
   name: string,
   patch: { ignored?: boolean; localOnly?: boolean; description?: string | null },
 ) {
-  const { canonicalPath } = await resolveProject(name);
+  const { projectPath, canonicalPath } = await resolveProject(name);
   const current = settings.projects[canonicalPath] || {};
   const next: StoredProjectPreference = { ...current };
   if (typeof patch.ignored === "boolean") next.ignored = patch.ignored;
@@ -1852,6 +1853,12 @@ export async function setProjectPreferences(
   if (!next.ignored && !next.localOnly && !next.description) delete settings.projects[canonicalPath];
   else settings.projects[canonicalPath] = next;
   await persistSettings();
+  const preference = preferenceFor(canonicalPath);
+  const description = patch.description === undefined
+    ? undefined
+    : await readdir(projectPath, { withFileTypes: true })
+      .then((entries) => discoverProjectDescription(projectPath, entries.map((entry) => entry.name), preference.description))
+      .catch(() => ({ text: "", compact: "", source: "none", sourceLabel: "No suitable local description found", sourceFile: null } satisfies ProjectDescription));
   return {
     message: patch.ignored === true
       ? `${name} moved to Hidden projects.`
@@ -1864,7 +1871,11 @@ export async function setProjectPreferences(
             : patch.description === null
               ? `Local description cleared for ${name}.`
               : `Local description saved for ${name}.`,
-    project: await refreshedProject(name),
+    patch: {
+      canonicalPath,
+      preferences: { ignored: preference.ignored, localOnly: preference.localOnly },
+      ...(description ? { description } : {}),
+    },
   };
 }
 
@@ -1889,6 +1900,78 @@ async function assertFolderManagedGit(root: string, projectPath: string) {
       { code: "agent_external_git" },
     );
   }
+}
+
+type ReconnectOptions = {
+  execute?: typeof run;
+  refresh?: (name: string) => Promise<ProjectRecord>;
+};
+
+/** Attach an unborn local branch to the repository already present on GitHub.
+ * `git reset --mixed` updates Git's HEAD and index but deliberately leaves every
+ * working-tree file untouched, so differences become ordinary local changes. */
+export async function reconnectProjectHistory(name: string, options: ReconnectOptions = {}) {
+  const { root, projectPath, canonicalPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
+  assertGithubActionAllowed(name, canonicalPath, "reconnecting local history");
+  const execute = options.execute || run;
+  const refresh = options.refresh || refreshedProject;
+  if (!(await exists(path.join(projectPath, ".git")))) {
+    throw new ProjectActionError("Initialize Git before reconnecting this folder.", 409);
+  }
+
+  const localHead = await execute("git", ["rev-parse", "--verify", "HEAD"], projectPath);
+  if (localHead.ok) {
+    throw new ProjectActionError("This folder already has local commits. Refresh to compare its history with GitHub.", 409, { code: "reconnect_not_empty" });
+  }
+
+  const origin = await execute("git", ["remote", "get-url", "origin"], projectPath);
+  if (!origin.ok || !parseGithubRemote(origin.stdout)) {
+    throw new ProjectActionError("Link the GitHub repository before reconnecting local history.", 409, { code: "reconnect_no_origin" });
+  }
+
+  const branchResult = await execute("git", ["branch", "--show-current"], projectPath);
+  const branch = branchResult.stdout || "main";
+  const fetched = await execute("git", ["fetch", "--quiet", "--prune", "origin"], projectPath, 30_000);
+  if (!fetched.ok) {
+    throw new ProjectActionError(friendlyCommandError(fetched, "GitHub could not be fetched. No working files were changed."), 409, { code: "reconnect_fetch_failed" });
+  }
+
+  const listed = await execute(
+    "git",
+    ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+    projectPath,
+  );
+  const remoteBranches = listed.stdout
+    .split("\n")
+    .map((value) => value.trim())
+    .filter((value) => value && value !== "origin/HEAD");
+  if (listed.ok && remoteBranches.length === 0) {
+    throw new ProjectActionError("The GitHub repository has no commits to reconnect. Use Initial commit & push instead; no working files were changed.", 409, { code: "reconnect_remote_empty" });
+  }
+  const preferred = `origin/${branch}`;
+  const remoteRef = remoteBranches.includes(preferred)
+    ? preferred
+    : remoteBranches.includes("origin/main")
+      ? "origin/main"
+      : remoteBranches.includes("origin/master")
+        ? "origin/master"
+        : remoteBranches.length === 1
+          ? remoteBranches[0]
+          : null;
+  if (!listed.ok || !remoteRef) {
+    throw new ProjectActionError("Project Deck could not identify one GitHub branch to reconnect. No working files were changed.", 409, { code: "reconnect_branch_ambiguous" });
+  }
+
+  const reset = await execute("git", ["reset", "--mixed", remoteRef], projectPath, 15_000);
+  if (!reset.ok) {
+    throw new ProjectActionError(friendlyCommandError(reset, "Local history could not be reconnected. No working files were overwritten."), 409, { code: "reconnect_failed" });
+  }
+  await execute("git", ["branch", "--set-upstream-to", remoteRef, branch], projectPath);
+  return {
+    message: `Reconnected ${branch} to ${remoteRef}. Working files were not overwritten; any differences now appear as local changes.`,
+    project: await refresh(name),
+  };
 }
 
 async function refreshedProject(name: string) {

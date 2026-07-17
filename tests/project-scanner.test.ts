@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, findLatestProjectFileAt, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, pullProject, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, findLatestProjectFileAt, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, pullProject, reconnectProjectHistory, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -427,7 +427,10 @@ test("persists path-scoped project intent without same-name root collisions", as
     await mkdir(path.join(rootA, "atlas"), { recursive: true }); await mkdir(path.join(rootB, "atlas"), { recursive: true });
     await writeFile(path.join(rootA, "atlas", "README.md"), "Atlas A is a useful local project with clear descriptive prose.\n");
     await writeFile(path.join(rootB, "atlas", "README.md"), "Atlas B is another useful project with different descriptive prose.\n");
-    process.env.GIT_SCAN_ROOT = rootA; await loadProjectsRoot(); await setProjectPreferences("atlas", { ignored: true, description: "A private description saved only for Atlas A." });
+    process.env.GIT_SCAN_ROOT = rootA; await loadProjectsRoot(); const preferenceResult = await setProjectPreferences("atlas", { ignored: true, description: "A private description saved only for Atlas A." });
+    assert.equal("project" in preferenceResult, false);
+    assert.deepEqual(preferenceResult.patch.preferences, { ignored: true, localOnly: false });
+    assert.equal(preferenceResult.patch.description?.source, "local");
     assert.equal((await scanProjects()).projects[0].preferences.ignored, true);
     assert.equal((await scanProjects()).projects[0].description.source, "local");
     process.env.GIT_SCAN_ROOT = rootB; await loadProjectsRoot();
@@ -522,6 +525,52 @@ test("pull fast-forwards a strictly-behind clean branch and refuses a dirty work
     };
     await assert.rejects(() => pullProject("atlas", { execute: dirty }), (error: unknown) => error instanceof ProjectActionError && error.code === "pull_dirty");
     assert.equal(dirtyCalls.some((call) => call.startsWith("fetch ") || call.startsWith("merge ")), false);
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("reconnect attaches an unborn branch with a mixed reset that preserves working files", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-reconnect-test-")); const root = path.join(temp, "root"); const projectPath = path.join(root, "brenda");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_ROOT = root; process.env.GIT_SCAN_SETTINGS_PATH = path.join(temp, "settings.json"); process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(projectPath, ".git"), { recursive: true });
+    await writeFile(path.join(projectPath, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(path.join(projectPath, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    await writeFile(path.join(projectPath, "profile.md"), "Local Brenda material that must remain untouched.\n");
+    await loadProjectsRoot();
+    const calls: string[] = [];
+    const execute = async (_command: string, args: string[]) => {
+      const key = args.join(" "); calls.push(key);
+      if (key === "rev-parse --verify HEAD") return { ok: false, stdout: "", stderr: "unknown revision", exitCode: 128 };
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/scottdflorida/brenda.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "for-each-ref --format=%(refname:short) refs/remotes/origin") return { ok: true, stdout: "origin/main", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    const result = await reconnectProjectHistory("brenda", { execute, refresh: async () => actionFixture("brenda") });
+    assert.match(result.message, /Working files were not overwritten/);
+    assert.equal(calls.includes("fetch --quiet --prune origin"), true);
+    assert.equal(calls.includes("reset --mixed origin/main"), true);
+    assert.equal(calls.includes("branch --set-upstream-to origin/main main"), true);
+    assert.equal(calls.some((call) => /checkout|merge|clean/u.test(call)), false);
+
+    const emptyRemote = async (_command: string, args: string[]) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --verify HEAD") return { ok: false, stdout: "", stderr: "unknown revision", exitCode: 128 };
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/scottdflorida/brenda.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "for-each-ref --format=%(refname:short) refs/remotes/origin") return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    await assert.rejects(
+      () => reconnectProjectHistory("brenda", { execute: emptyRemote }),
+      (error: unknown) => error instanceof ProjectActionError && error.code === "reconnect_remote_empty" && /Initial commit & push/u.test(error.message),
+    );
   } finally {
     if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
     if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;

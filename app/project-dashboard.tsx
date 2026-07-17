@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectScanResponse, RootSelectionResponse } from "@/lib/project-types";
+import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectRecordPatch, ProjectScanResponse, RootSelectionResponse } from "@/lib/project-types";
 import { attentionReason, compareProjects, gitPresentation, githubPresentation, hasDisconnectedHistory, needsAttention, projectActivity, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
 import { formatProjectSize } from "@/lib/format-project-size";
 import { AlertCircle, ArrowDown, ArrowUp, Check, Copy, ExternalLink, Folder, GitBranch, Github, LoaderCircle, Lock, Minus, MoreHorizontal, Pencil, RefreshCw, Search, Unlock, X } from "@/app/icons";
@@ -10,15 +10,15 @@ const RETRY_MS = 4_000;
 const API_TIMEOUT_MS = 5_000;
 const API_PORT = process.env.NEXT_PUBLIC_PROJECT_DECK_API_PORT || "4317";
 const viewLabels: Record<ProjectView, string> = { working: "Working set", attention: "Needs attention", local: "GitHub sync off", ignored: "Hidden projects" };
-const sortLabels: Record<SortKey, string> = { name: "Project", size: "Total size", git: "Git", github: "GitHub", sync: "Sync" };
+const sortLabels: Record<SortKey, string> = { name: "Project", size: "Total size", activity: "Latest activity", git: "Git", github: "GitHub", sync: "Sync" };
 type GithubAuthState = { checked: boolean; cliAvailable: boolean; connected: boolean; login: string | null };
-type ProjectActionKind = "init" | "link" | "create-repo" | "pull" | "push" | "preferences";
-type RepoModal = { type: "create" | "link" | "pull" | "push"; project: ProjectRecord; trigger: HTMLElement | null };
+type ProjectActionKind = "init" | "link" | "create-repo" | "pull" | "push" | "reconnect" | "preferences";
+type RepoModal = { type: "create" | "link" | "pull" | "push" | "reconnect"; project: ProjectRecord; trigger: HTMLElement | null };
 type PreferenceModal = { type: "preference"; kind: "ignored" | "localOnly"; project: ProjectRecord; trigger: HTMLElement | null };
 type DescriptionModal = { type: "description"; project: ProjectRecord; trigger: HTMLElement | null };
 type ModalState = RepoModal | PreferenceModal | DescriptionModal | null;
 type ProjectActionFailure = { projectPath: string; projectName: string; kind: ProjectActionKind; label: string; message: string; code?: string };
-const actionLabels: Record<ProjectActionKind, string> = { init: "Initialize Git", link: "Link repository", "create-repo": "Create GitHub repository", pull: "Pull from GitHub", push: "Publish to GitHub", preferences: "Update project preference" };
+const actionLabels: Record<ProjectActionKind, string> = { init: "Initialize Git", link: "Link repository", "create-repo": "Create GitHub repository", pull: "Pull from GitHub", push: "Publish to GitHub", reconnect: "Reconnect Git history", preferences: "Update project preference" };
 
 function apiUrl(path: string) {
   if (typeof window === "undefined") return path;
@@ -66,6 +66,14 @@ function exactTimestamp(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? "Not reported" : date.toLocaleString();
 }
 
+function mergeProjectPatch(project: ProjectRecord, patch: ProjectRecordPatch): ProjectRecord {
+  return {
+    ...project,
+    preferences: patch.preferences,
+    ...(patch.description ? { description: patch.description, summary: patch.description.compact } : {}),
+  };
+}
+
 function useDialogFocus(ref: React.RefObject<HTMLElement | null>, busy: boolean, onClose: () => void) {
   useEffect(() => {
     const node = ref.current;
@@ -103,8 +111,9 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
   const create = modal.type === "create";
   const link = modal.type === "link";
   const pull = modal.type === "pull";
+  const reconnect = modal.type === "reconnect";
   const emptyInitial = !modal.project.git.hasCommits && modal.project.git.changeCount === 0;
-  const title = create ? "Create a GitHub repository" : link ? modal.project.git.isRepository ? "Link repository" : "Initialize & link" : pull ? `Pull ${modal.project.sync.behind} remote commit${modal.project.sync.behind === 1 ? "" : "s"}` : emptyInitial ? "Create initial commit & push" : modal.project.git.changeCount ? `Commit & push ${modal.project.git.changeCount} local change${modal.project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
+  const title = create ? "Create a GitHub repository" : link ? modal.project.git.isRepository ? "Link repository" : "Initialize & link" : reconnect ? "Reconnect local Git history" : pull ? `Pull ${modal.project.sync.behind} remote commit${modal.project.sync.behind === 1 ? "" : "s"}` : !modal.project.git.hasCommits ? "Create initial commit & push" : modal.project.git.changeCount ? `Commit & push ${modal.project.git.changeCount} local change${modal.project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
   const matchedRepository = modal.project.github.repository?.nameWithOwner || "the matched GitHub repository";
   const consequence = create
     ? modal.project.git.isRepository
@@ -114,6 +123,8 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
       ? modal.project.git.isRepository
         ? `This adds ${matchedRepository} as origin. It does not change project files or commits.`
         : `This initializes local Git and adds ${matchedRepository} as origin. It does not change project files or create commits.`
+      : reconnect
+        ? `This fetches ${matchedRepository}, attaches this folder’s empty ${modal.project.git.branch || "local"} branch to its existing history, and leaves every working file untouched. Files that differ from GitHub will appear afterward as ordinary local changes for you to review.`
       : pull
         ? `This fetches GitHub and fast-forwards ${modal.project.git.branch || "the current branch"} by ${modal.project.sync.behind} commit${modal.project.sync.behind === 1 ? "" : "s"}. It refuses to run if there are local changes or the histories have diverged.`
       : emptyInitial
@@ -127,9 +138,9 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
     <p className="kicker">REPOSITORY ACTION · {modal.project.name}</p><h2 id="repo-dialog-title">{title}</h2>
     <p>{consequence}</p>
     {create ? <div className="choice-grid" role="radiogroup" aria-label="Repository visibility">{(["private", "public"] as const).map((value) => <button key={value} data-dialog-initial={value === "private" ? "true" : undefined} role="radio" aria-checked={visibility === value} className={visibility === value ? "selected" : ""} onClick={() => setVisibility(value)}>{value === "private" ? <Lock size={17}/> : <Unlock size={17}/>}<span><strong>{value === "private" ? "Private" : "Public"}</strong><small>{value === "private" ? "Only invited people" : "Visible to everyone"}</small></span>{visibility === value && <Check size={17}/>}</button>)}</div>
-      : !link && !pull && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && <label className="field"><span>Commit message</span><input data-dialog-initial="true" value={message} maxLength={120} onChange={(event) => setMessage(event.target.value)} /><small>Obvious untracked secret files are blocked before staging.</small></label>}
+      : !link && !pull && !reconnect && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && <label className="field"><span>Commit message</span><input data-dialog-initial="true" value={message} maxLength={120} onChange={(event) => setMessage(event.target.value)} /><small>Obvious untracked secret files are blocked before staging.</small></label>}
     {error && error.projectPath === modal.project.canonicalPath && <div className="action-dialog-error" role="alert"><strong>{error.label} failed for {error.projectName}</strong><span>{error.message}</span></div>}
-    <div className="dialog-actions"><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button ref={submit} data-dialog-initial={link || pull ? "true" : undefined} className="button primary" disabled={busy || (!create && !link && !pull && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && !message.trim())} onClick={() => onSubmit(create ? { visibility } : link || pull ? {} : { message })}>{busy ? <LoaderCircle className="spin" size={15}/> : create || link ? <Github size={15}/> : pull ? <ArrowDown size={15}/> : <ArrowUp size={15}/>} {busy ? "Working…" : title}</button></div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button ref={submit} data-dialog-initial={link || pull || reconnect ? "true" : undefined} className="button primary" disabled={busy || (!create && !link && !pull && !reconnect && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && !message.trim())} onClick={() => onSubmit(create ? { visibility } : link || pull || reconnect ? {} : { message })}>{busy ? <LoaderCircle className="spin" size={15}/> : create || link ? <Github size={15}/> : pull ? <ArrowDown size={15}/> : reconnect ? <RefreshCw size={15}/> : <ArrowUp size={15}/>} {busy ? "Working…" : title}</button></div>
   </DialogFrame>;
 }
 
@@ -155,7 +166,7 @@ function GitColumnAction({ project, busy, onAction }: { project: ProjectRecord; 
   const git = gitPresentation(project);
   if (git.key === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Checking local Git…</span>;
   if (git.key === "not_initialized") return <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={14}/> Initialize Git</button><small>Creates local .git only</small></div>;
-  if (git.key === "no_commits" && project.preferences.localOnly && !hasDisconnectedHistory(project)) return <span className="action-guidance"><Check size={13}/> Local Git initialized · first commit optional</span>;
+  if (git.key === "no_commits" && project.preferences.localOnly) return <span className="action-guidance"><Check size={13}/> Local Git initialized · first commit optional</span>;
   if (project.git.metadataSource === "agent_external") return <span className="action-guidance"><Check size={13}/> Agent-managed Git</span>;
   return null;
 }
@@ -172,7 +183,7 @@ function GithubColumnAction({ project, githubAvailable, busy, onModal }: { proje
     {project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open matched repository <ExternalLink size={12}/></a>}
   </div>;
   if (github.key === "match_found") return <div className="rail-column-action">
-    {!hasDisconnectedHistory(project) && <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={14}/> {project.git.isRepository ? "Link repository" : "Initialize & link"}</button>}
+    <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={14}/> {project.git.isRepository ? "Link repository" : "Initialize & link"}</button>
     {project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open matched repository <ExternalLink size={12}/></a>}
   </div>;
   if (github.key === "none" && githubAvailable) return <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={14}/> Create repository</button></div>;
@@ -202,7 +213,7 @@ function SyncColumnAction({ project, busy, onModal }: { project: ProjectRecord; 
   const sync = syncPresentation(project);
   const externallyManaged = project.git.metadataSource === "agent_external";
   let action: React.ReactNode = null;
-  if (sync.key === "history_mismatch") action = <span className="action-guidance danger"><AlertCircle size={13}/> Review the evidence below before pushing</span>;
+  if (sync.key === "history_mismatch") action = <div className="rail-column-action"><button className="button primary" disabled={busy || project.github.state !== "linked"} onClick={(event) => onModal({ type: "reconnect", project, trigger: event.currentTarget })}><RefreshCw size={14}/> Reconnect history</button><small>{project.github.state === "linked" ? "Keeps working files; repairs local Git metadata" : "Link the repository first, then reconnect"}</small></div>;
   else if (sync.key === "no_repository") action = <span className="action-guidance"><Minus size={13}/> No sync check needed</span>;
   else if (project.preferences.localOnly) action = <span className="action-guidance"><Check size={13}/> Sync actions and alerts ignored</span>;
   else if (sync.key === "checking") action = <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Comparing refs…</span>;
@@ -216,7 +227,7 @@ function SyncColumnAction({ project, busy, onModal }: { project: ProjectRecord; 
   else if (sync.key === "not_checked") action = <span className="action-guidance">Refresh to check the comparison again</span>;
   else if (externallyManaged && (git.key === "changes" || git.key === "no_commits" || sync.key === "ahead" || sync.key === "not_pushed")) action = <span className="action-guidance caution">Commit and push through the active coding session</span>;
   else if (project.github.state === "linked" && (git.key === "no_commits" || git.key === "changes" || sync.key === "ahead" || sync.key === "not_pushed")) {
-    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Initial commit & push" : project.git.changeCount ? `Commit & push ${project.git.changeCount} change${project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
+    const label = !project.git.hasCommits ? "Initial commit & push" : project.git.changeCount ? `Commit & push ${project.git.changeCount} change${project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
     action = <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={14}/> {label}</button></div>;
   } else if (sync.key === "in_sync") action = <span className="action-guidance good"><Check size={13}/> Up to date</span>;
   else if (sync.key === "not_linked" && project.github.state === "matched") action = <span className="action-guidance">Link the repository in the GitHub column</span>;
@@ -228,13 +239,14 @@ function StatusEvidence({ project }: { project: ProjectRecord }) {
   const github = githubPresentation(project);
   const sync = syncPresentation(project);
   const repository = project.github.repository;
-  return <details className="status-evidence" open={hasDisconnectedHistory(project) || undefined}>
+  const disconnected = hasDisconnectedHistory(project) && !project.preferences.localOnly;
+  return <details className="status-evidence">
     <summary>Status evidence</summary>
     <dl>
       <div><dt>Local Git</dt><dd>{project.git.metadataSource === "agent_external" ? "Agent-managed external Git metadata. " : ""}{git.label}. {git.detail}</dd></div>
       <div><dt>Origin</dt><dd>{project.github.state === "linked" ? repository?.nameWithOwner || "GitHub origin configured" : "No origin remote is configured in this folder"}</dd></div>
-      <div><dt>GitHub</dt><dd>{repository ? `${repository.nameWithOwner} · latest push ${exactTimestamp(repository.pushedAt)}` : github.detail}</dd></div>
-      <div><dt>Comparison</dt><dd>{sync.detail}</dd></div>
+      <div><dt>GitHub</dt><dd>{repository ? repository.isEmpty === true ? `${repository.nameWithOwner} · empty repository` : `${repository.nameWithOwner} · latest push ${exactTimestamp(repository.pushedAt)}` : github.detail}</dd></div>
+      <div><dt>Comparison</dt><dd>{disconnected ? "The GitHub repository has commits, while this folder’s local branch is unborn. Reconnect history to attach the local branch without replacing working files." : sync.detail}</dd></div>
     </dl>
   </details>;
 }
@@ -251,7 +263,8 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
         <div className="path-line"><span>Folder path</span><code>{project.canonicalPath}</code><button onClick={() => onCopy(project)} aria-label={`Copy absolute folder path for ${project.name}`}><Copy size={13}/> Copy folder path</button></div>
         <div className="working-set-preference"><span>Visibility</span><button type="button" className={project.preferences.ignored ? "active" : ""} aria-pressed={project.preferences.ignored} disabled={busy} onClick={(event) => onModal({ type: "preference", kind: "ignored", project, trigger: event.currentTarget })}>{project.preferences.ignored ? "Show in working set" : "Hide project"}</button></div>
       </div>
-      <div className="project-facts"><div><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong></div><div><span>Latest activity:</span><time dateTime={update.at || undefined} title={update.exact} aria-label={`Latest activity: ${update.relative}. ${update.source}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time><small className="activity-source">{update.source}</small></div>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
+      <div className="project-facts project-size"><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}</div>
+      <div className="project-facts project-activity"><span>Latest activity</span><time dateTime={update.at || undefined} title={update.exact} aria-label={`Latest activity: ${update.relative}. ${update.source}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time><small className="activity-source">{update.source}</small>{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
       <div className="repository-rail" aria-label={`Repository state for ${project.name}`}>
         <div className={`rail-stop ${git.tone}`} data-state-key={git.key}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{refreshingDetail(git.detail, git.refreshing)}</small><GitColumnAction project={project} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)}/></div>
         <div className={`rail-stop ${github.tone}`} data-state-key={github.key}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{refreshingDetail(github.detail, github.refreshing)}</small><GithubColumnAction project={project} githubAvailable={githubAvailable} busy={busy} onModal={onModal}/><GithubPreferenceControl project={project} busy={busy} onModal={onModal}/></div>
@@ -262,13 +275,13 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
   </li>;
 }
 
-function Skeleton() { return <li className="project-row skeleton" aria-hidden="true"><div className="sk sk-wide"/><div className="sk"/><div className="sk sk-rail"/></li>; }
+function Skeleton() { return <li className="project-row skeleton" aria-hidden="true"><div className="sk sk-wide"/><div className="sk"/><div className="sk"/><div className="sk sk-rail"/></li>; }
 
 function LedgerColumns({ sortKey, sortDirection, onSort }: { sortKey: SortKey; sortDirection: SortDirection; onSort: (key: SortKey) => void }) {
   return <div className="ledger-columns" aria-label="Sortable project columns">
     {(Object.keys(sortLabels) as SortKey[]).map((key) => {
       const active = sortKey === key;
-      const nextDirection = active ? sortDirection === "asc" ? "descending" : "ascending" : key === "size" ? "descending" : "ascending";
+      const nextDirection = active ? sortDirection === "asc" ? "descending" : "ascending" : key === "size" || key === "activity" ? "descending" : "ascending";
       const current = active ? `, sorted ${sortDirection === "asc" ? "ascending" : "descending"}` : "";
       return <button key={key} type="button" data-sort-key={key} className={active ? "active" : ""} aria-pressed={active} aria-label={`${sortLabels[key]}${current}. Activate to sort ${nextDirection}.`} onClick={() => onSort(key)}>
         <span>{sortLabels[key]}</span>{active && (sortDirection === "asc" ? <ArrowUp size={14} aria-hidden="true"/> : <ArrowDown size={14} aria-hidden="true"/>)}
@@ -297,7 +310,7 @@ export function ProjectDashboard() {
   const loadProjects = useCallback(async (refresh = false, manual = false) => { if (requestActive.current) { if (manual) queuedLoad.current = { refresh, manual }; return; } if (manual) { outageAttempts.current = 0; if (retryTimer.current) window.clearTimeout(retryTimer.current); setRetryPending(false); setRetryExhausted(false); } const silentRetry = !manual && !refresh && outageAttempts.current > 0 && !dataRef.current; requestActive.current = true; if (refresh) setRefreshing(true); else if (!silentRetry) setLoading(true); if (!silentRetry) setScannerError(null); try { const response = await fetchLocal(`/api/projects${refresh ? "?refresh=remote" : ""}`, { cache: "no-store" }); if (!response.ok) throw new Error(); const result = await response.json() as ProjectScanResponse; dataRef.current = result; setData(result); outageAttempts.current = 0; setRetryPending(false); setRetryExhausted(false); setScannerError(null); } catch { setScannerError("The local scanner is unavailable."); if (!dataRef.current) { outageAttempts.current += 1; if (outageAttempts.current === 1) { setRetryPending(true); retryTimer.current = window.setTimeout(() => { void loadRef.current(false); }, RETRY_MS); } else { setRetryPending(false); setRetryExhausted(true); } } } finally { requestActive.current = false; setLoading(false); setRefreshing(false); const queued = queuedLoad.current; queuedLoad.current = null; if (queued) window.setTimeout(() => void loadRef.current(queued.refresh, queued.manual), 0); } }, []);
   useEffect(() => { loadRef.current = loadProjects; }, [loadProjects]);
   useEffect(() => { dataRef.current = data; }, [data]);
-  useEffect(() => { const initial = window.setTimeout(() => { try { const lens = JSON.parse(window.localStorage.getItem("project-deck-lens-v1") || "{}"); if (!lensInteracted.current) { if (["working", "attention", "local", "ignored"].includes(lens.view)) setView(lens.view); if (["name", "size", "git", "github", "sync"].includes(lens.sortKey)) setSortKey(lens.sortKey); if (["asc", "desc"].includes(lens.sortDirection)) setSortDirection(lens.sortDirection); } } catch { /* safe defaults */ } setLensReady(true); void loadRef.current(false); }, 0); return () => { window.clearTimeout(initial); if (retryTimer.current) window.clearTimeout(retryTimer.current); }; }, []);
+  useEffect(() => { const initial = window.setTimeout(() => { try { const lens = JSON.parse(window.localStorage.getItem("project-deck-lens-v1") || "{}"); if (!lensInteracted.current) { if (["working", "attention", "local", "ignored"].includes(lens.view)) setView(lens.view); if (["name", "size", "activity", "git", "github", "sync"].includes(lens.sortKey)) setSortKey(lens.sortKey); if (["asc", "desc"].includes(lens.sortDirection)) setSortDirection(lens.sortDirection); } } catch { /* safe defaults */ } setLensReady(true); void loadRef.current(false); }, 0); return () => { window.clearTimeout(initial); if (retryTimer.current) window.clearTimeout(retryTimer.current); }; }, []);
   useEffect(() => { if (!lensReady) return; window.localStorage.setItem("project-deck-lens-v1", JSON.stringify({ view, sortKey, sortDirection })); }, [lensReady, view, sortKey, sortDirection]);
   useEffect(() => { const id = window.setTimeout(() => { if (!window.localStorage.getItem("project-deck-onboarding-complete")) setOnboardingOpen(true); void refreshGithubAuth(); }, 0); return () => window.clearTimeout(id); }, [refreshGithubAuth]);
   useEffect(() => { if (!authCode || githubAuth.connected) return; const id = window.setInterval(() => void refreshGithubAuth(), 3000); return () => window.clearInterval(id); }, [authCode, githubAuth.connected, refreshGithubAuth]);
@@ -305,6 +318,7 @@ export function ProjectDashboard() {
   useEffect(() => { if (!data?.enriching) return; const id = window.setInterval(() => void loadRef.current(false), 5000); return () => window.clearInterval(id); }, [data?.enriching]);
   useEffect(() => { if (!toast) return; const id = window.setTimeout(() => setToast(null), 4000); return () => window.clearTimeout(id); }, [toast]);
   const updateProject = useCallback((project: ProjectRecord, scannedAt = new Date().toISOString()) => setData((current) => current ? { ...current, scannedAt, projects: current.projects.map((item) => item.canonicalPath === project.canonicalPath ? project : item) } : current), []);
+  const updateProjectPatch = useCallback((patch: ProjectRecordPatch, scannedAt = new Date().toISOString()) => setData((current) => current ? { ...current, scannedAt, projects: current.projects.map((item) => item.canonicalPath === patch.canonicalPath ? mergeProjectPatch(item, patch) : item) } : current), []);
   const focusProjectAction = useCallback((projectPath: string) => {
     const row = [...document.querySelectorAll<HTMLElement>("[data-project-path]")].find((item) => item.dataset.projectPath === projectPath);
     row?.querySelector<HTMLElement>(".rail-column-action button, .project-action-error button")?.focus();
@@ -313,6 +327,19 @@ export function ProjectDashboard() {
     if (busyProject) return;
     const trigger = directTrigger || modal?.trigger || null;
     const label = kind === "link" && !project.git.isRepository ? "Initialize & link" : actionLabels[kind];
+    const preferenceKey = kind === "preferences"
+      ? (["ignored", "localOnly"] as const).find((key) => typeof payload[key] === "boolean")
+      : undefined;
+    const optimisticPatch = preferenceKey
+      ? {
+          canonicalPath: project.canonicalPath,
+          preferences: { ...project.preferences, [preferenceKey]: payload[preferenceKey] as boolean },
+        } satisfies ProjectRecordPatch
+      : null;
+    if (optimisticPatch) {
+      updateProjectPatch(optimisticPatch);
+      setModal(null);
+    }
     setBusyProject(project.canonicalPath);
     setActionError(null);
     try {
@@ -320,6 +347,7 @@ export function ProjectDashboard() {
       const result = await response.json() as ActionResponse | ActionFailureResponse;
       if (!response.ok || !result.ok) {
         const failed: ActionFailureResponse = result.ok === false ? result : { ok: false, error: "The action could not be completed." };
+        if (optimisticPatch) updateProject(project);
         if (failed.project) updateProject(failed.project);
         const failure: ProjectActionFailure = { projectPath: project.canonicalPath, projectName: project.name, kind, label, message: failed.error || "The action could not be completed.", code: failed.code };
         setActionError(failure);
@@ -332,8 +360,10 @@ export function ProjectDashboard() {
         }
         return;
       }
-      const leavesActiveView = projectInView(project, view) && !projectInView(result.project, view);
-      updateProject(result.project);
+      const updatedProject = result.project || mergeProjectPatch(project, result.patch);
+      const leavesActiveView = projectInView(project, view) && !projectInView(updatedProject, view);
+      if (result.project) updateProject(result.project);
+      else updateProjectPatch(result.patch);
       setToast(result.message);
       setModal(null);
       requestAnimationFrame(() => {
@@ -346,7 +376,7 @@ export function ProjectDashboard() {
     } finally {
       setBusyProject(null);
     }
-  }, [busyProject, focusProjectAction, modal, updateProject, view]);
+  }, [busyProject, focusProjectAction, modal, updateProject, updateProjectPatch, view]);
   const allProjects = useMemo(() => data?.projects || [], [data?.projects]);
   const counts = useMemo(() => { const ignored = allProjects.filter((project) => project.preferences.ignored); const working = allProjects.filter((project) => !project.preferences.ignored); return { onDisk: allProjects.length, working: working.length, ignored: ignored.length, local: working.filter((project) => project.preferences.localOnly).length, attention: working.filter(needsAttention).length, bytes: allProjects.reduce((sum, project) => sum + (project.size.status === "complete" ? project.size.bytes : 0), 0) }; }, [allProjects]);
   const viewBase = useMemo(() => allProjects.filter((project) => projectInView(project, view)), [allProjects, view]);
@@ -354,11 +384,11 @@ export function ProjectDashboard() {
   const sortFromHeader = useCallback((next: SortKey) => {
     lensInteracted.current = true;
     if (next === sortKey) setSortDirection((current) => current === "asc" ? "desc" : "asc");
-    else { setSortKey(next); setSortDirection(next === "size" ? "desc" : "asc"); }
+    else { setSortKey(next); setSortDirection(next === "size" || next === "activity" ? "desc" : "asc"); }
   }, [sortKey]);
   const sortFromSelect = useCallback((next: SortKey) => {
     lensInteracted.current = true;
-    if (next !== sortKey) setSortDirection(next === "size" ? "desc" : "asc");
+    if (next !== sortKey) setSortDirection(next === "size" || next === "activity" ? "desc" : "asc");
     setSortKey(next);
   }, [sortKey]);
   const copy = async (project: ProjectRecord) => { setUtilityError(null); try { await navigator.clipboard.writeText(project.canonicalPath); setToast(`Absolute folder path copied for ${project.name}`); } catch { setUtilityError(`Couldn’t copy the absolute folder path for ${project.name}. Select it from the project record and copy it manually: ${project.canonicalPath}`); } };
@@ -395,7 +425,7 @@ export function ProjectDashboard() {
     {!loading && !data && scannerError && <div className="state-surface" role="status"><AlertCircle/><p className="kicker">LOCAL SERVICE · OFFLINE</p><h3>Project Deck could not reach the local service</h3><p>{retryPending ? "Trying once more. This page will stay usable while Project Deck checks again." : retryExhausted ? "Restart Project Deck, then retry. No project files or settings were changed." : "The local project service did not respond."}</p><button className="button primary" onClick={() => void loadProjects(false, true)}><RefreshCw size={15}/> Retry now</button></div>}
     {!loading && data && emptyKind && <div className="state-surface"><Folder/><p className="kicker">{emptyKind === "root" ? "ROOT · EMPTY" : emptyKind === "ignored-only" ? "WORKING SET · EMPTY" : "VIEW · EMPTY"}</p><h3>{emptyKind === "root" ? "No project folders found" : emptyKind === "ignored-only" ? "Every project is hidden" : emptyKind === "query" ? `No matches in ${viewLabels[view]}` : `${viewLabels[view]} is empty`}</h3><p>{emptyKind === "root" ? `${data.rootLabel} is available, but it contains no direct child folders.` : emptyKind === "ignored-only" ? "Nothing was deleted. Your projects remain on disk and are available under Hidden projects." : emptyKind === "query" ? "Clear the search to return to this view without changing its sort or scope." : view === "ignored" ? "Projects you hide using the Visibility control will appear here and can be shown again." : "No projects currently meet this view’s rules."}</p>{emptyKind === "ignored-only" ? <button className="button primary" onClick={() => setView("ignored")}>Show hidden projects</button> : emptyKind === "query" ? <button className="button secondary" onClick={() => setQuery("")}>Clear search</button> : null}</div>}</section></div>
     <div className="sr-only" role="status" aria-live="polite">{refreshing ? "Refreshing project facts" : toast || ""}</div>{toast && <div className="toast" role="status"><Check size={15}/>{toast}</div>}
-    {modal?.type === "create" || modal?.type === "link" || modal?.type === "pull" || modal?.type === "push" ? <RepoActionModal modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal} onSubmit={(payload) => void action(modal.project, modal.type === "create" ? "create-repo" : modal.type === "link" ? "link" : modal.type === "pull" ? "pull" : "push", payload)}/> : null}
+    {modal?.type === "create" || modal?.type === "link" || modal?.type === "pull" || modal?.type === "push" || modal?.type === "reconnect" ? <RepoActionModal modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal} onSubmit={(payload) => void action(modal.project, modal.type === "create" ? "create-repo" : modal.type === "link" ? "link" : modal.type === "pull" ? "pull" : modal.type === "reconnect" ? "reconnect" : "push", payload)}/> : null}
     {modal?.type === "preference" && <PreferenceDialog
       modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal}
       onConfirm={() => void action(modal.project, "preferences", { [modal.kind]: !modal.project.preferences[modal.kind] })}

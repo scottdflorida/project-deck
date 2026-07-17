@@ -1,7 +1,7 @@
 import type { ProjectRecord } from "./project-types";
 
 export type ProjectView = "working" | "attention" | "local" | "ignored";
-export type SortKey = "name" | "size" | "git" | "github" | "sync";
+export type SortKey = "name" | "size" | "activity" | "git" | "github" | "sync";
 export type SortDirection = "asc" | "desc";
 export type PresentationTone = "good" | "warn" | "bad" | "neutral" | "checking" | "quiet";
 export type PresentationResolution = "known" | "pending" | "not_checked";
@@ -40,7 +40,7 @@ function validTimestamp(value: string | null | undefined) {
 export function hasDisconnectedHistory(project: ProjectRecord) {
   return (project.github.state === "matched" || project.github.state === "linked")
     && !project.git.hasCommits
-    && validTimestamp(project.github.repository?.pushedAt) !== null;
+    && project.github.repository?.isEmpty === false;
 }
 
 export type ProjectActivity = {
@@ -53,7 +53,9 @@ export type ProjectActivity = {
  * fallback only when neither local nor GitHub history exists. */
 export function projectActivity(project: ProjectRecord): ProjectActivity {
   const localTime = validTimestamp(project.git.lastCommitAt);
-  const githubTime = validTimestamp(project.github.repository?.pushedAt);
+  const githubTime = project.github.repository?.isEmpty === true
+    ? null
+    : validTimestamp(project.github.repository?.pushedAt);
   if (localTime === null && githubTime === null) {
     const fileTime = validTimestamp(project.latestFileAt);
     return fileTime === null
@@ -75,7 +77,7 @@ export function gitPresentation(project: ProjectRecord): StatePresentation<GitPr
   // HEAD is a tiny metadata read and remains truthful even when the worktree is
   // cloud-backed or slow. It must win over status enumeration failure.
   if (!project.git.hasCommits) {
-    const optional = project.preferences.localOnly && !hasDisconnectedHistory(project);
+    const optional = project.preferences.localOnly;
     return {
       key: "no_commits",
       label: "No local commits",
@@ -115,7 +117,7 @@ export function githubPresentation(project: ProjectRecord): StatePresentation<Gi
 export function syncPresentation(project: ProjectRecord): StatePresentation<SyncPresentationKey> {
   const refreshing = project.transient?.sync === "checking";
   const state = project.sync.state;
-  if (hasDisconnectedHistory(project)) return { key: "history_mismatch", label: "Histories disconnected", detail: "GitHub has pushed history, but this folder has no local commits. Do not push until its Git metadata is repaired or the repository is cloned again.", tone: "bad", resolution: "known", actionable: false, refreshing, count: 0 };
+  if (hasDisconnectedHistory(project) && !project.preferences.localOnly) return { key: "history_mismatch", label: "Local history not connected", detail: "This folder was initialized separately from the GitHub repository. Its files are still here, but its local .git has not been attached to GitHub’s existing commits.", tone: "bad", resolution: "known", actionable: project.github.state === "linked", refreshing, count: 0 };
   if (state === "in_sync") {
     if (project.git.statusAvailable && project.git.changeCount > 0) {
       const count = project.git.changeCount;
@@ -176,7 +178,7 @@ export function projectActionKey(project: ProjectRecord, githubAvailable: boolea
 export function needsAttention(project: ProjectRecord) {
   const git = gitPresentation(project);
   if (git.key === "checking") return false;
-  if (hasDisconnectedHistory(project)) return true;
+  if (hasDisconnectedHistory(project) && !project.preferences.localOnly) return true;
   if (git.key === "not_initialized") return true;
   if (git.key === "no_commits") return !project.preferences.localOnly;
   if (git.key === "changes") return true;
@@ -191,7 +193,7 @@ export function needsAttention(project: ProjectRecord) {
 export function attentionReason(project: ProjectRecord) {
   const git = gitPresentation(project);
   if (git.key === "checking") return "Local Git status is being checked";
-  if (hasDisconnectedHistory(project)) return "GitHub has commits, but this folder’s local Git history is empty";
+  if (hasDisconnectedHistory(project) && !project.preferences.localOnly) return "This folder’s local Git history is not connected to the existing GitHub commits";
   if (git.key === "not_initialized") return "Git is not initialized";
   if (git.key === "no_commits") return project.preferences.localOnly ? "No attention needed" : "This folder has no local commits";
   if (git.key === "changes") return git.label;
@@ -242,6 +244,12 @@ function sizeProjection(project: ProjectRecord): SortProjection {
   return { bucket: project.transient?.size ? 1 : 2, rank: 0, count: 0 };
 }
 
+function activityProjection(project: ProjectRecord): SortProjection {
+  const timestamp = validTimestamp(projectActivity(project).at);
+  if (timestamp !== null) return { bucket: 0, rank: timestamp, count: 0 };
+  return { bucket: project.transient?.activity ? 1 : 2, rank: 0, count: 0 };
+}
+
 function compareProjection(a: SortProjection, b: SortProjection, direction: SortDirection) {
   if (a.bucket !== b.bucket) return a.bucket - b.bucket;
   if (a.bucket !== 0) return a.rank - b.rank;
@@ -256,6 +264,7 @@ export function compareProjects(a: ProjectRecord, b: ProjectRecord, key: SortKey
     return primary ? multiplier * primary : exactIdentityTie(a, b);
   }
   if (key === "size") return compareProjection(sizeProjection(a), sizeProjection(b), direction) || stableIdentity(a, b);
+  if (key === "activity") return compareProjection(activityProjection(a), activityProjection(b), direction) || stableIdentity(a, b);
   const aProjection = key === "git" ? gitProjection(a) : key === "github" ? githubProjection(a) : syncProjection(a);
   const bProjection = key === "git" ? gitProjection(b) : key === "github" ? githubProjection(b) : syncProjection(b);
   return compareProjection(aProjection, bProjection, direction) || stableIdentity(a, b);

@@ -80,6 +80,21 @@ test("name direction reverses the primary name but keeps exact ties deterministi
   assert.deepEqual([...values].sort((a, b) => compareProjects(a, b, "name", "desc")).map((item) => item.name), ["Atlas 10", "ATLAS 2", "atlas 2"]);
 });
 
+test("latest activity sorts by Git activity with file fallback and unresolved values last", () => {
+  const olderCommit = project("older-commit", { git: { ...project("fixture").git, lastCommitAt: "2026-07-10T12:00:00.000Z" } });
+  const newerPush = project("newer-push", { github: { state: "linked", repository: { name: "newer-push", nameWithOwner: "person/newer-push", url: "https://github.com/person/newer-push", isPrivate: true, pushedAt: "2026-07-17T12:00:00.000Z" } } });
+  const fileFallback = project("file-fallback", {
+    git: { ...project("fixture").git, lastCommitAt: null },
+    github: { state: "none", repository: null },
+    latestFileAt: "2026-07-12T12:00:00.000Z",
+  });
+  const pending = project("pending", { github: { state: "none", repository: null }, transient: { activity: "checking" } });
+  const missing = project("missing", { github: { state: "none", repository: null } });
+  const values = [newerPush, pending, olderCommit, missing, fileFallback];
+  assert.deepEqual([...values].sort((a, b) => compareProjects(a, b, "activity", "asc")).map((item) => item.name), ["older-commit", "file-fallback", "newer-push", "pending", "missing"]);
+  assert.deepEqual([...values].sort((a, b) => compareProjects(a, b, "activity", "desc")).map((item) => item.name), ["newer-push", "file-fallback", "older-commit", "pending", "missing"]);
+});
+
 test("local-only intent ignores remote attention without hiding local Git concerns", () => {
   const remoteMissing = project("local", { preferences: { ignored: false, localOnly: true }, github: { state: "none", repository: null }, sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." } });
   assert.equal(needsAttention(remoteMissing), false);
@@ -194,15 +209,15 @@ test("sync explicitly states when no GitHub repository exists", () => {
 test("a pushed same-name repository cannot masquerade as a safely linkable empty history", () => {
   const mismatch = project("lifting", {
     git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 30, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
-    github: { state: "matched", repository: { name: "lifting", nameWithOwner: "person/lifting", url: "https://github.com/person/lifting", isPrivate: true, pushedAt: "2026-07-17T18:29:31.000Z" } },
+    github: { state: "matched", repository: { name: "lifting", nameWithOwner: "person/lifting", url: "https://github.com/person/lifting", isPrivate: true, isEmpty: false, pushedAt: "2026-07-17T18:29:31.000Z" } },
     sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." },
   });
   assert.equal(hasDisconnectedHistory(mismatch), true);
   assert.equal(gitPresentation(mismatch).label, "No local commits");
   assert.equal(syncPresentation(mismatch).key, "history_mismatch");
-  assert.equal(syncPresentation(mismatch).label, "Histories disconnected");
+  assert.equal(syncPresentation(mismatch).label, "Local history not connected");
   assert.equal(projectActionKey(mismatch, true), "review_history");
-  assert.match(attentionReason(mismatch), /local Git history is empty/);
+  assert.match(attentionReason(mismatch), /not connected/);
   assert.equal(projectActivity(mismatch).source, "github_push");
 
   const linkedButEmpty = {
@@ -213,6 +228,24 @@ test("a pushed same-name repository cannot masquerade as a safely linkable empty
   assert.equal(hasDisconnectedHistory(linkedButEmpty), true);
   assert.equal(syncPresentation(linkedButEmpty).key, "history_mismatch");
   assert.equal(projectActionKey(linkedButEmpty, true), "review_history");
+
+  const intentionallyLocal = { ...linkedButEmpty, preferences: { ignored: false, localOnly: true } };
+  assert.equal(needsAttention(intentionallyLocal), false);
+  assert.equal(syncPresentation(intentionallyLocal).key, "no_commits");
+  assert.equal(gitPresentation(intentionallyLocal).tone, "neutral");
+});
+
+test("an empty GitHub repository is not mistaken for disconnected history or Git activity", () => {
+  const emptyRemote = project("brenda", {
+    git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 7, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "linked", repository: { name: "brenda", nameWithOwner: "person/brenda", url: "https://github.com/person/brenda", isPrivate: true, isEmpty: true, pushedAt: "2026-07-17T20:50:19.000Z" } },
+    sync: { state: "no_commits", ahead: 0, behind: 0, checkedRemote: false, detail: "There are no local commits yet." },
+    latestFileAt: "2026-07-16T10:00:00.000Z",
+  });
+  assert.equal(hasDisconnectedHistory(emptyRemote), false);
+  assert.equal(syncPresentation(emptyRemote).key, "no_commits");
+  assert.equal(projectActivity(emptyRemote).source, "file_update");
+  assert.equal(projectActionKey(emptyRemote, true), "push");
 });
 
 test("action guidance never calls an unchecked working tree up to date", () => {
