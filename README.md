@@ -88,6 +88,12 @@ The header always shows the active parent folder. Use **Open** to reveal it in
 the system file browser or **Change** to select another parent. Selecting the
 folder already in use is an immediate no-op and keeps the current dashboard.
 
+The dashboard talks directly to the loopback-only local service instead of
+routing filesystem requests through the web preview. If that service stops or
+cannot answer, the initial placeholders are replaced within five seconds by a
+clear recovery message. Restart `npm run dev`, then choose **Retry now**; the
+failed check does not change any project files or settings.
+
 When GitHub is disconnected, the header shows **Connect GitHub** rather than an
 ambiguous status. The in-app device flow repairs expired credentials and unlocks
 repository matching, creation, linking, and sync actions. Choose **Refresh** to

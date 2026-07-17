@@ -29,11 +29,12 @@ let quickSizeScanInFlight: Promise<ScanResult> | null = null;
 const scansInFlight = new Map<string, Promise<ScanResult>>();
 let scanGeneration = 0;
 let lastAuthenticatedGithubLogin: string | null = null;
+let githubAuthenticationChecked = false;
 
-function invalidateScanCaches() {
+function invalidateScanCaches(preserveQuick = false) {
   scanGeneration += 1;
   scanCache = null;
-  quickScanCache = null;
+  if (!preserveQuick) quickScanCache = null;
   quickScanInFlight = null;
   quickSizeScanInFlight = null;
   scansInFlight.clear();
@@ -63,31 +64,41 @@ async function getProjectScan(refreshRemote: boolean) {
   if (refreshRemote) return startDeepScan(true, generation);
 
   if (quickScanCache) return quickScanCache;
-  quickScanInFlight ??= scanProjectsQuick(false).then((value) => {
+  return startQuickScan(generation);
+}
+
+function startQuickScan(generation = scanGeneration) {
+  if (quickScanInFlight) return quickScanInFlight;
+
+  const initialScan = scanProjectsQuick(false).then((value) => {
+    if (generation !== scanGeneration) return value;
     if (generation === scanGeneration) quickScanCache = value;
-    quickSizeScanInFlight ??= scanProjectsQuick(true, (factsValue) => {
+    if (quickSizeScanInFlight) return value;
+
+    const sizeScan = scanProjectsQuick(true, (factsValue) => {
       if (generation === scanGeneration) {
         quickScanCache = factsValue;
-        void startDeepScan(false, generation);
       }
     })
       .then((sizedValue) => {
         if (generation === scanGeneration) {
           quickScanCache = sizedValue;
-          void startDeepScan(false, generation);
+          void startDeepScan(false, generation).catch(() => undefined);
         }
         return sizedValue;
       })
       .catch(() => {
-        if (generation === scanGeneration) void startDeepScan(false, generation);
+        if (generation === scanGeneration) void startDeepScan(false, generation).catch(() => undefined);
         return value;
-      })
-      .finally(() => {
-        quickSizeScanInFlight = null;
       });
+    quickSizeScanInFlight = sizeScan;
+    void sizeScan.finally(() => {
+      if (quickSizeScanInFlight === sizeScan) quickSizeScanInFlight = null;
+    });
     return value;
   });
-  return quickScanInFlight;
+  quickScanInFlight = initialScan;
+  return initialScan;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown) {
@@ -153,10 +164,21 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/github/auth") {
       const auth = await getGithubAuthentication();
-      if (auth.connected && auth.login !== lastAuthenticatedGithubLogin) {
-        lastAuthenticatedGithubLogin = auth.login;
+      const loginChanged = githubAuthenticationChecked
+        && auth.connected
+        && auth.login !== lastAuthenticatedGithubLogin;
+      lastAuthenticatedGithubLogin = auth.connected ? auth.login : null;
+      githubAuthenticationChecked = true;
+      if (loginChanged) {
         clearGithubContextCache();
-        invalidateScanCaches();
+        if (quickScanCache) {
+          invalidateScanCaches(true);
+          void startQuickScan(scanGeneration).catch(() => undefined);
+        } else {
+          // The first inventory request already renders Git/GitHub as checking.
+          // Let it finish instead of discarding it during the parallel auth check.
+          scanCache = null;
+        }
       }
       sendJson(response, 200, auth);
       return;

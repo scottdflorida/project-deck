@@ -571,6 +571,53 @@ export async function discoverProjectDescription(projectPath: string, names: str
   return { text: "", compact: "", source: "none", sourceLabel: "No suitable local description found", sourceFile: null };
 }
 
+async function discoverProjectDescriptionWithCommands(
+  root: string,
+  projectPath: string,
+  names: string[],
+  localOverride: string | null,
+): Promise<ProjectDescription> {
+  if (localOverride) {
+    const text = cleanDescription(localOverride);
+    if (text) return { text, compact: compactDescription(text), source: "local", sourceLabel: "Edited in Project Deck", sourceFile: null };
+  }
+
+  const readBounded = async (file: string) => {
+    const result = await run("head", ["-c", "65536", path.join(projectPath, file)], root, 1_200);
+    return result.stdout;
+  };
+
+  for (const slot of ["README.md", "README", "README.rst", "README.txt", "ABOUT.md", "OVERVIEW.md"]) {
+    const file = winningName(names, slot);
+    if (!file) continue;
+    const description = descriptionFromOverview(await readBounded(file));
+    if (description) return fileDescription(description, file);
+  }
+
+  const packageFile = winningName(names, "package.json");
+  if (packageFile) {
+    try {
+      const packageJson = JSON.parse(await readBounded(packageFile)) as { description?: unknown };
+      const description = typeof packageJson.description === "string" ? acceptedDescription(packageJson.description) : null;
+      if (description) return fileDescription(description, packageFile);
+    } catch {
+      // Continue to other metadata sources.
+    }
+  }
+
+  for (const [slot, sections] of [["pyproject.toml", ["project", "tool.poetry"]], ["Cargo.toml", ["package"]]] as const) {
+    const file = winningName(names, slot);
+    if (!file) continue;
+    const contents = await readBounded(file);
+    for (const section of sections) {
+      const description = acceptedDescription(tomlDescription(contents, section) || "");
+      if (description) return fileDescription(description, file);
+    }
+  }
+
+  return { text: "", compact: "", source: "none", sourceLabel: "No suitable local description found", sourceFile: null };
+}
+
 function detectTechnologies(names: string[]) {
   const lowerNames = new Set(names.map((name) => name.toLowerCase()));
   const technologies: string[] = [];
@@ -1047,25 +1094,37 @@ export async function scanProjectsQuick(
     };
   }
 
-  const projectSizesPromise = measureProjectSizesForRoot(root, folderNames);
   const githubPromise = getGithubContext(root);
   const fastNow = new Date().toISOString();
-  const fastProjects = await mapWithConcurrency(folderNames, 32, async (name) => {
+  const fastProjects = await mapWithConcurrency(folderNames, 12, async (name) => {
     const projectPath = path.join(root, name);
-    const gitExists = await settleWithin(
-      lstat(path.join(projectPath, ".git")).then(() => true, () => false),
-      800,
-      null as boolean | null,
-    );
+    let gitExists = false;
     let branch: string | null = null;
+    let origin = "";
+    if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0") {
+      gitExists = await exists(path.join(projectPath, ".git"));
+      if (gitExists) {
+        const [head, config] = await Promise.all([
+          readFile(path.join(projectPath, ".git", "HEAD"), "utf8").catch(() => ""),
+          readFile(path.join(projectPath, ".git", "config"), "utf8").catch(() => ""),
+        ]);
+        const trimmedHead = head.trim();
+        branch = trimmedHead.startsWith("ref: refs/heads/") ? trimmedHead.slice("ref: refs/heads/".length) : null;
+        origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim() || "";
+      }
+    } else {
+      const [repositoryResult, branchResult, originResult] = await Promise.all([
+        run("git", ["rev-parse", "--is-inside-work-tree"], projectPath, 1_000),
+        run("git", ["branch", "--show-current"], projectPath, 1_000),
+        run("git", ["remote", "get-url", "origin"], projectPath, 1_000),
+      ]);
+      gitExists = repositoryResult.ok && repositoryResult.stdout === "true";
+      branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : null;
+      origin = originResult.ok ? originResult.stdout : "";
+    }
     let linkedRepository: GithubRepository | null = null;
-    if (gitExists === true) {
-      const head = await settleWithin(readFile(path.join(projectPath, ".git", "HEAD"), "utf8"), 800, "");
-      const trimmedHead = head.trim();
-      branch = trimmedHead.startsWith("ref: refs/heads/") ? trimmedHead.slice("ref: refs/heads/".length) : null;
-      const config = await settleWithin(readFile(path.join(projectPath, ".git", "config"), "utf8"), 800, "");
-      const origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim();
-      const parsed = origin ? parseGithubRemote(origin) : null;
+    if (gitExists && origin) {
+      const parsed = parseGithubRemote(origin);
       if (parsed) linkedRepository = { name: parsed.repo, nameWithOwner: parsed.nameWithOwner, url: parsed.url, isPrivate: null };
     }
     const projectPreference = preferenceFor(projectPath);
@@ -1080,104 +1139,96 @@ export async function scanProjectsQuick(
       technologies: [],
       modifiedAt: fastNow,
       size: { ...SIZE_ERROR },
-      git: { isRepository: gitExists === true, branch, hasCommits: gitExists === true, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+      git: { isRepository: gitExists, branch, hasCommits: gitExists, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
       github: { state: linkedRepository ? "linked" as const : "unavailable" as const, repository: linkedRepository },
-      sync: { state: linkedRepository ? "unavailable" as const : gitExists === null ? "unavailable" as const : "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: linkedRepository ? "The GitHub remote is linked; detailed sync status is still being checked." : gitExists === null ? "Local Git metadata is still being checked." : "No GitHub remote is linked." },
-      transient: { size: "checking" as const, ...(gitExists === null || gitExists === true ? { git: "checking" as const } : {}), ...(gitExists === null ? { github: "checking" as const, sync: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
+      sync: { state: linkedRepository ? "unavailable" as const : "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: linkedRepository ? "The GitHub remote is linked; detailed sync status is still being checked." : "No GitHub remote is linked." },
+      transient: { size: "checking" as const, ...(gitExists ? { git: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
     } satisfies ProjectRecord;
   });
   onFacts?.({ rootPath: root, rootLabel: rootLabel(root), scannedAt: fastNow, enriching: true, github: { available: false, login: null }, projects: fastProjects });
 
   const github = await githubPromise;
-  const projects = await mapWithConcurrency(folderNames, 32, async (name) => {
-    const projectPath = path.join(root, name);
-    const canonicalPath = await canonicalizeProjectPath(projectPath);
-    const [projectEntries, projectStat, isRepository] = await Promise.all([
-      readdir(projectPath, { withFileTypes: true }).catch(() => []),
-      stat(projectPath),
-      exists(path.join(projectPath, ".git")),
-    ]);
-    const names = projectEntries.map((entry) => entry.name);
-    let branch: string | null = null;
-    let linkedRepository: GithubRepository | null = null;
-    if (isRepository) {
-      try {
-        const head = (await readFile(path.join(projectPath, ".git", "HEAD"), "utf8")).trim();
-        branch = head.startsWith("ref: refs/heads/") ? head.slice("ref: refs/heads/".length) : null;
-      } catch {
-        branch = null;
-      }
-      try {
-        const config = await readFile(path.join(projectPath, ".git", "config"), "utf8");
-        const origin = config.match(/\[remote "origin"\][\s\S]*?^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim();
-        const parsed = origin ? parseGithubRemote(origin) : null;
-        if (parsed) {
-          linkedRepository = github.byFullName.get(parsed.nameWithOwner.toLowerCase()) || {
-            name: parsed.repo,
-            nameWithOwner: parsed.nameWithOwner,
-            url: parsed.url,
-            isPrivate: null,
-          };
-        }
-      } catch {
-        linkedRepository = null;
-      }
-    }
-    const matchedRepository = github.byName.get(name.toLowerCase()) || null;
-    const projectPreference = preferenceFor(canonicalPath);
-    const description = await discoverProjectDescription(projectPath, names, projectPreference.description);
-
+  const githubProjects = fastProjects.map((project) => {
+    const knownLinked = project.github.repository
+      ? github.byFullName.get(project.github.repository.nameWithOwner.toLowerCase()) || project.github.repository
+      : null;
+    const matchedRepository = github.byName.get(project.name.toLowerCase()) || null;
     return {
-      name,
-      canonicalPath,
-      pathLabel: `${rootLabel(root)}/${name}`,
-      description,
-      summary: description.compact,
-      preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
-      technologies: detectTechnologies(names),
-      modifiedAt: projectStat.mtime.toISOString(),
-      size: { ...SIZE_ERROR },
-      git: {
-        isRepository,
-        branch,
-        hasCommits: isRepository,
-        changeCount: 0,
-        statusAvailable: false,
-        lastCommitAt: null,
-        lastCommitMessage: null,
-      },
+      ...project,
       github: {
-        state: linkedRepository ? "linked" as const : matchedRepository ? "matched" as const : github.available ? "none" as const : "unavailable" as const,
-        repository: linkedRepository || matchedRepository,
+        state: knownLinked ? "linked" as const : matchedRepository ? "matched" as const : github.available ? "none" as const : "unavailable" as const,
+        repository: knownLinked || matchedRepository,
       },
       sync: {
-        state: linkedRepository ? "unavailable" as const : "no_remote" as const,
+        state: knownLinked ? "unavailable" as const : "no_remote" as const,
         ahead: 0,
         behind: 0,
         checkedRemote: false,
-        detail: linkedRepository
+        detail: knownLinked
           ? "The GitHub remote is linked; commit and sync details are still being checked."
           : "No GitHub remote is linked.",
       },
       transient: {
         size: "checking" as const,
-        ...(isRepository ? { git: "checking" as const } : {}),
-        ...(linkedRepository ? { sync: "checking" as const } : {}),
+        ...(project.git.isRepository ? { git: "checking" as const } : {}),
+        ...(knownLinked ? { sync: "checking" as const } : {}),
       },
     } satisfies ProjectRecord;
   });
-
-  const factsResponse: ProjectScanResponse = {
+  const githubResponse: ProjectScanResponse = {
     rootPath: root,
     rootLabel: rootLabel(root),
     scannedAt: new Date().toISOString(),
     enriching: true,
     github: { available: github.available, login: github.login },
+    projects: githubProjects,
+  };
+  onFacts?.(githubResponse);
+
+  const projects = await mapWithConcurrency(githubProjects, 12, async (project) => {
+    const projectPath = path.join(root, project.name);
+    const names = platform() === "win32"
+      ? (await settleWithin(
+          readdir(projectPath, { withFileTypes: true }).catch(() => []),
+          2_000,
+          [],
+        )).map((entry) => entry.name)
+      : (await run("ls", ["-1A", projectPath], root, 2_000)).stdout.split("\n").filter(Boolean);
+    const unavailableDescription: ProjectDescription = {
+      text: "",
+      compact: "",
+      source: "none",
+      sourceLabel: "No suitable local description found",
+      sourceFile: null,
+    };
+    const projectPreference = preferenceFor(projectPath);
+    const description = await settleWithin(
+      platform() === "win32"
+        ? discoverProjectDescription(projectPath, names, projectPreference.description)
+        : discoverProjectDescriptionWithCommands(root, projectPath, names, projectPreference.description),
+      2_500,
+      unavailableDescription,
+    );
+
+    return {
+      ...project,
+      description,
+      summary: description.compact,
+      technologies: detectTechnologies(names),
+    } satisfies ProjectRecord;
+  });
+
+  const factsResponse: ProjectScanResponse = {
+    ...githubResponse,
+    scannedAt: new Date().toISOString(),
     projects,
   };
   onFacts?.(factsResponse);
 
-  const projectSizes = await projectSizesPromise;
+  // Size measurement is intentionally last. A large dependency tree can keep
+  // du busy for tens of seconds, but it must never compete with names, local
+  // Git facts, descriptions, or GitHub linkage needed for the useful ledger.
+  const projectSizes = await measureProjectSizesForRoot(root, folderNames);
   return {
     ...factsResponse,
     scannedAt: new Date().toISOString(),
