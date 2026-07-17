@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ProjectRecord } from "../lib/project-types";
-import { compareProjects, needsAttention, projectInView } from "../lib/project-ledger";
+import { attentionReason, compareProjects, needsAttention, projectInView } from "../lib/project-ledger";
 
 function project(name: string, patch: Partial<ProjectRecord> = {}): ProjectRecord {
   return {
@@ -50,8 +50,8 @@ test("keeps known facts ranked, pending facts next, and unavailable facts last i
   const notGit = project("not-git", { git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } });
   const changed = project("changed", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } });
   const gitValues = [pendingGit, unavailableGit, cachedClean, noCommitsDuringRefresh, changed, notGit];
-  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "asc")).map((item) => item.name), ["not-git", "no-commits", "changed", "cached-clean", "pending-git", "unavailable-git"]);
-  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "desc")).map((item) => item.name), ["cached-clean", "changed", "no-commits", "not-git", "pending-git", "unavailable-git"]);
+  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "asc")).map((item) => item.name), ["not-git", "changed", "cached-clean", "no-commits", "pending-git", "unavailable-git"]);
+  assert.deepEqual([...gitValues].sort((a, b) => compareProjects(a, b, "git", "desc")).map((item) => item.name), ["cached-clean", "changed", "not-git", "no-commits", "pending-git", "unavailable-git"]);
 
   const githubValues = [
     project("none", { github: { state: "none", repository: null } }),
@@ -98,4 +98,12 @@ test("pending Git discovery is not mislabeled as a project needing attention", (
   });
   assert.equal(needsAttention(pending), false);
   assert.equal(projectInView(pending, "attention"), false);
+});
+
+test("unavailable Git metadata is never presented as a known empty repository", () => {
+  const unavailable = project("offloaded", {
+    git: { isRepository: true, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
+  });
+  assert.equal(attentionReason(unavailable), "Local Git status is unavailable");
+  assert.equal(needsAttention(unavailable), true);
 });

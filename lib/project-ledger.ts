@@ -29,8 +29,8 @@ function exactIdentityTie(a: ProjectRecord, b: ProjectRecord) {
 export function gitProjection(project: ProjectRecord) {
   if (!project.git.isRepository && project.transient?.git) return { bucket: 1, rank: 0, count: 0 } satisfies SortProjection;
   if (!project.git.isRepository) return { bucket: 0, rank: 0, count: 0 } satisfies SortProjection;
-  if (!project.git.hasCommits) return { bucket: 0, rank: 1, count: 0 } satisfies SortProjection;
   if (!project.git.statusAvailable) return { bucket: project.transient?.git ? 1 : 2, rank: 0, count: 0 } satisfies SortProjection;
+  if (!project.git.hasCommits) return { bucket: 0, rank: 1, count: 0 } satisfies SortProjection;
   return project.git.changeCount > 0
     ? { bucket: 0, rank: 2, count: project.git.changeCount } satisfies SortProjection
     : { bucket: 0, rank: 3, count: 0 } satisfies SortProjection;
@@ -46,8 +46,8 @@ export function needsAttention(project: ProjectRecord) {
 export function attentionReason(project: ProjectRecord) {
   if (project.transient?.git === "checking") return "Local Git status is being checked";
   if (!project.git.isRepository) return "Git is not initialized";
-  if (!project.git.hasCommits) return "The repository has no commits";
   if (!project.git.statusAvailable) return "Local Git status is unavailable";
+  if (!project.git.hasCommits) return "The repository has no commits";
   if (project.git.changeCount > 0) return `${project.git.changeCount} local ${project.git.changeCount === 1 ? "change" : "changes"}`;
   if (project.preferences.localOnly) return "Local Git is settled";
   if (project.github.state !== "linked") return project.github.state === "matched" ? "A GitHub match is ready to link" : "No GitHub repository is linked";
