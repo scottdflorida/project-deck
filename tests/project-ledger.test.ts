@@ -84,6 +84,17 @@ test("local-only intent ignores remote attention without hiding local Git concer
   const remoteMissing = project("local", { preferences: { ignored: false, localOnly: true }, github: { state: "none", repository: null }, sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." } });
   assert.equal(needsAttention(remoteMissing), false);
   assert.equal(projectInView(remoteMissing, "local"), true);
+  const initializedWithoutCommits = project("empty-local", {
+    preferences: { ignored: false, localOnly: true },
+    git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 8, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "none", repository: null },
+    sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." },
+  });
+  assert.equal(needsAttention(initializedWithoutCommits), false);
+  assert.equal(attentionReason(initializedWithoutCommits), "No attention needed");
+  assert.equal(gitPresentation(initializedWithoutCommits).tone, "neutral");
+  assert.equal(gitPresentation(initializedWithoutCommits).actionable, false);
+  assert.match(gitPresentation(initializedWithoutCommits).detail, /first commit is optional/);
   const localChange = project("changed", { preferences: { ignored: false, localOnly: true }, git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 1, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } });
   assert.equal(needsAttention(localChange), true);
   assert.equal(projectInView({ ...localChange, preferences: { ignored: true, localOnly: true } }, "attention"), false);

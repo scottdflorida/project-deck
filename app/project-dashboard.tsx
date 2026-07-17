@@ -155,6 +155,7 @@ function GitColumnAction({ project, busy, onAction }: { project: ProjectRecord; 
   const git = gitPresentation(project);
   if (git.key === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Checking local Git…</span>;
   if (git.key === "not_initialized") return <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={14}/> Initialize Git</button><small>Creates local .git only</small></div>;
+  if (git.key === "no_commits" && project.preferences.localOnly && !hasDisconnectedHistory(project)) return <span className="action-guidance"><Check size={13}/> Local Git initialized · first commit optional</span>;
   if (project.git.metadataSource === "agent_external") return <span className="action-guidance"><Check size={13}/> Agent-managed Git</span>;
   return null;
 }

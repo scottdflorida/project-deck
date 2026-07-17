@@ -43,6 +43,12 @@ offers **Keep local only**; when a repository already exists, that control is
 instead labeled **Ignore GitHub sync** because the remote is not changed or made
 “local only.” **Resume GitHub sync** reverses that preference.
 
+For an explicitly local-only project, initializing Git is enough to settle the
+initial setup state. Until a first commit exists, Git remains truthful as **No
+local commits** but treats that as neutral, with **First commit optional**, rather
+than keeping the project in Needs attention. Once local history exists, later
+uncommitted changes still appear in Needs attention.
+
 Sync labels separate committed history from working-tree changes. **In sync**
 means the local and GitHub commit histories match and the working tree is clean.
 **Commits in sync** means those histories match but uncommitted local changes

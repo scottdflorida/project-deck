@@ -74,7 +74,21 @@ export function gitPresentation(project: ProjectRecord): StatePresentation<GitPr
   }
   // HEAD is a tiny metadata read and remains truthful even when the worktree is
   // cloud-backed or slow. It must win over status enumeration failure.
-  if (!project.git.hasCommits) return { key: "no_commits", label: "No local commits", detail: `${project.git.branch || "No branch yet"} · this folder’s .git has no HEAD commit`, tone: "warn", resolution: "known", actionable: true, refreshing, count: 0 };
+  if (!project.git.hasCommits) {
+    const optional = project.preferences.localOnly && !hasDisconnectedHistory(project);
+    return {
+      key: "no_commits",
+      label: "No local commits",
+      detail: optional
+        ? `${project.git.branch || "No branch yet"} · local Git is initialized; a first commit is optional for this local-only project`
+        : `${project.git.branch || "No branch yet"} · this folder’s .git has no HEAD commit`,
+      tone: optional ? "neutral" : "warn",
+      resolution: "known",
+      actionable: !optional,
+      refreshing,
+      count: 0,
+    };
+  }
   if (project.git.statusAvailable) {
     if (project.git.changeCount > 0) {
       const count = project.git.changeCount;
@@ -162,7 +176,10 @@ export function projectActionKey(project: ProjectRecord, githubAvailable: boolea
 export function needsAttention(project: ProjectRecord) {
   const git = gitPresentation(project);
   if (git.key === "checking") return false;
-  if (["not_initialized", "no_commits", "changes"].includes(git.key)) return true;
+  if (hasDisconnectedHistory(project)) return true;
+  if (git.key === "not_initialized") return true;
+  if (git.key === "no_commits") return !project.preferences.localOnly;
+  if (git.key === "changes") return true;
   if (project.preferences.localOnly) return false;
   const github = githubPresentation(project);
   if (github.key === "checking") return false;
@@ -176,7 +193,7 @@ export function attentionReason(project: ProjectRecord) {
   if (git.key === "checking") return "Local Git status is being checked";
   if (hasDisconnectedHistory(project)) return "GitHub has commits, but this folder’s local Git history is empty";
   if (git.key === "not_initialized") return "Git is not initialized";
-  if (git.key === "no_commits") return "This folder has no local commits";
+  if (git.key === "no_commits") return project.preferences.localOnly ? "No attention needed" : "This folder has no local commits";
   if (git.key === "changes") return git.label;
   if (project.preferences.localOnly) return "Local Git is settled";
   const github = githubPresentation(project);
