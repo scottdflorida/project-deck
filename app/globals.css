@@ -102,17 +102,16 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .ledger > header { display: grid; grid-template-columns: 1fr; gap: 13px; align-items: end; min-height: 82px; padding: 15px 12px 10px; }
 .ledger > header h2 { margin: 0; font-size: 15px; font-weight: 520; letter-spacing: -.02em; }
 .ledger > header h2 span { color: var(--muted); font-weight: 400; }
-.ledger-columns { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(135px, .7fr) minmax(150px, .8fr) minmax(150px, .8fr) minmax(180px, .85fr); gap: 14px; align-items: stretch; border-top: 1px solid var(--line); }
-.ledger-columns button, .action-column-label { min-width: 0; min-height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--faint); font: 9px var(--font-geist-mono), monospace; letter-spacing: .09em; text-align: left; text-transform: uppercase; transition: background 140ms ease, border-color 140ms ease, color 140ms ease; }
+.ledger-columns { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: stretch; border-top: 1px solid var(--line); }
+.ledger-columns button { min-width: 0; min-height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--faint); font: 9px var(--font-geist-mono), monospace; letter-spacing: .09em; text-align: left; text-transform: uppercase; transition: background 140ms ease, border-color 140ms ease, color 140ms ease; }
 .ledger-columns button:hover { background: var(--surface); color: var(--ink-2); }
 .ledger-columns button.active { border-bottom-color: var(--accent); background: var(--accent-wash); color: var(--accent-dark); }
 .ledger-columns button:focus-visible { position: relative; z-index: 2; outline: 3px solid #5576e2; outline-offset: -3px; }
 .ledger-columns button svg { flex: 0 0 auto; }
-.action-column-label { cursor: default; }
 .project-list { list-style: none; margin: 0; padding: 0; }
 .project-row { border-top: 1px solid var(--line); }
 .project-row:last-child { border-bottom: 1px solid var(--line); }
-.project-record { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(135px, .7fr) minmax(150px, .8fr) minmax(150px, .8fr) minmax(180px, .85fr); gap: 14px; align-items: start; padding: 18px 12px 19px; background: rgba(251,251,249,.48); transition: background 150ms ease; }
+.project-record { display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: start; padding: 18px 12px 19px; background: rgba(251,251,249,.48); transition: background 150ms ease; }
 .project-record:hover { background: var(--surface); }
 .project-identity { min-width: 0; }
 .identity-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr) 40px; gap: 11px; align-items: start; }
@@ -170,12 +169,12 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .rail-stop.quiet > span { color: var(--muted); }
 .rail-stop.checking > span { color: var(--accent-dark); }
 
-.record-actions { min-width: 0; display: grid; gap: 10px; justify-items: start; }
-.primary-action { display: flex; flex-wrap: wrap; gap: 5px; }
-.primary-action .button { min-height: 36px; }
-.local-init { display: grid; gap: 4px; justify-items: start; }
-.local-init small { color: var(--faint); font-size: 9px; }
+.rail-column-action { display: grid; gap: 5px; margin-top: 10px; }
+.rail-column-action .button { width: 100%; min-height: 32px; padding: 5px 7px; font-size: 9px; line-height: 1.25; white-space: normal; }
+.rail-column-action > a { width: max-content; max-width: 100%; display: inline-flex; align-items: center; gap: 4px; color: var(--accent-dark); font-size: 9px; line-height: 1.35; text-decoration: underline; text-underline-offset: 3px; }
+.rail-column-action > small { color: var(--faint); font-size: 8px; line-height: 1.35; }
 .project-action-error, .action-dialog-error { display: grid; gap: 5px; padding: 9px 10px; border: 1px solid #dfb4b1; border-radius: 5px; background: var(--bad-wash); color: #7f2e2e; font-size: 10px; line-height: 1.4; }
+.row-action-error { grid-column: 1 / -1; }
 .project-action-error p { margin: 0; overflow-wrap: anywhere; }
 .project-action-error button { width: max-content; min-height: 28px; padding: 0; border: 0; background: transparent; color: #7f2e2e; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
 .action-dialog-error { margin-top: 14px; font-size: 11px; }
@@ -183,16 +182,15 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .action-guidance.good { color: var(--good); }
 .action-guidance.caution { color: var(--warn); }
 .action-guidance.danger { color: var(--bad); }
-.record-utilities { display: grid; gap: 7px; color: var(--muted); font-size: 10px; }
-.record-utilities a { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-dark); text-decoration: none; }
-.record-utilities summary { width: max-content; text-decoration: underline; text-underline-offset: 3px; }
-.status-evidence[open] { width: min(100%, 230px); }
+.status-evidence { margin-top: 9px; color: var(--muted); font-size: 9px; }
+.status-evidence summary { width: max-content; max-width: 100%; text-decoration: underline; text-underline-offset: 3px; }
+.status-evidence[open] { width: 100%; }
 .status-evidence dl { display: grid; gap: 8px; margin: 8px 0 0; padding: 9px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
 .status-evidence dl > div { display: grid; gap: 2px; }
 .status-evidence dt { color: var(--faint); font: 8px var(--font-geist-mono), monospace; letter-spacing: .06em; text-transform: uppercase; }
 .status-evidence dd { margin: 0; color: var(--ink-2); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
 
-.skeleton { min-height: 144px; display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(135px, .7fr) minmax(150px, .8fr) minmax(150px, .8fr) minmax(180px, .85fr); gap: 14px; align-items: center; padding: 18px 12px; }
+.skeleton { min-height: 144px; display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(155px, .8fr) minmax(170px, .9fr) minmax(190px, 1fr); gap: 14px; align-items: center; padding: 18px 12px; }
 .sk { height: 22px; border-radius: 3px; background: #e3e2dd; animation: pulse 1.5s ease-in-out infinite; }
 .sk-wide { height: 68px; }
 .sk-rail { grid-column: 3 / 6; height: 54px; }
@@ -246,8 +244,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
   .responsive-sort-controls { grid-column: 1 / 3; display: flex; justify-content: flex-end; }
   .ledger-columns { display: none; }
   .project-record { grid-template-columns: minmax(330px, 1fr) 150px; }
-  .repository-rail { grid-column: 1 / 2; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .record-actions { grid-column: 2; grid-row: 2; }
+  .repository-rail { grid-column: 1 / 3; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .skeleton { grid-template-columns: 1fr 150px; }
   .sk-rail { grid-column: 1; }
 }
@@ -283,8 +280,6 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
   .project-facts { grid-template-columns: 1fr 1fr; padding-left: 45px; }
   .project-facts .technology-list, .attention-reason { grid-column: 1 / 3; }
   .repository-rail { grid-column: 1; }
-  .record-actions { grid-column: 1; grid-row: auto; padding-left: 45px; }
-  .primary-action .button { min-height: 44px; }
   .rail-stop { min-height: 102px; padding-inline: 8px; }
   .rail-stop:first-child { padding-left: 0; }
   .rail-stop small { -webkit-line-clamp: 3; }
@@ -319,8 +314,8 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 }
 
 @media (pointer: coarse) {
-  .button, .root-action, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .record-utilities a, .record-utilities summary, .search-field button, .project-action-error button { min-height: 44px; }
-  .record-utilities a, .record-utilities summary { display: inline-flex; align-items: center; }
+  .button, .root-action, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .rail-column-action a, .status-evidence summary, .search-field button, .project-action-error button { min-height: 44px; }
+  .rail-column-action a, .status-evidence summary { display: inline-flex; align-items: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {

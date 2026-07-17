@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectScanResponse, RootSelectionResponse } from "@/lib/project-types";
-import { attentionReason, compareProjects, gitPresentation, githubPresentation, hasDisconnectedHistory, needsAttention, projectActionKey, projectActivity, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
+import { attentionReason, compareProjects, gitPresentation, githubPresentation, hasDisconnectedHistory, needsAttention, projectActivity, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
 import { formatProjectSize } from "@/lib/format-project-size";
 import { AlertCircle, ArrowDown, ArrowUp, Check, Copy, ExternalLink, Folder, GitBranch, Github, LoaderCircle, Lock, MoreHorizontal, Pencil, RefreshCw, Search, Unlock, X } from "@/app/icons";
 
@@ -139,25 +139,51 @@ function DescriptionDialog({ modal, busy, error, onClose, onSave, onClear }: { m
   return <DialogFrame titleId="description-title" busy={busy} onClose={onClose}><p className="kicker">LOCAL NOTE · {modal.project.name}</p><h2 id="description-title">Edit local description</h2><p>This note is stored in Project Deck for this absolute folder path. It never edits README, manifests, or Git.</p><label className="field"><span>Project description</span><textarea data-dialog-initial="true" rows={6} maxLength={2000} value={value} onChange={(event) => setValue(event.target.value)} placeholder={modal.project.description.text || "What is this project for?"}/><small>{value.length} / 2000</small></label>{error?.projectPath === modal.project.canonicalPath && <div className="action-dialog-error" role="alert"><strong>{error.label} failed for {error.projectName}</strong><span>{error.message}</span></div>}<div className="dialog-actions split">{modal.project.description.source === "local" ? <button className="button quiet danger" onClick={onClear} disabled={busy}>Clear local description</button> : <span/>}<button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="button primary" onClick={() => onSave(value)} disabled={busy || !value.trim()}>{busy && <LoaderCircle className="spin" size={15}/>} Save description</button></div></DialogFrame>;
 }
 
-function ProjectActions({ project, githubAvailable, busy, onAction, onModal }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; onAction: (kind: "init", trigger: HTMLElement) => void; onModal: (modal: RepoModal) => void }) {
-  const actionKey = projectActionKey(project, githubAvailable);
-  if (actionKey === "checking_git") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking local Git…</span>;
-  if (actionKey === "init") return <div className="local-init"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={15}/> Initialize Git</button><small>Creates local .git only</small></div>;
-  if (actionKey === "local_only") return <span className="action-guidance"><Check size={14}/> Local only</span>;
-  if (actionKey === "link") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={15}/> {project.git.isRepository ? "Link repository" : "Initialize & link"}</button>;
-  if (actionKey === "create") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={15}/> Create GitHub repository</button>;
-  if (actionKey === "checking_sync") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking sync…</span>;
-  if (actionKey === "reconcile") return <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
-  if (actionKey === "review_history") return <span className="action-guidance danger"><AlertCircle size={14}/> Local and GitHub histories are disconnected — review the evidence below</span>;
-  if (actionKey === "working_tree_not_checked") return <span className="action-guidance">Working tree not checked — make files available, then refresh</span>;
-  if (actionKey === "comparison_not_checked") return <span className="action-guidance">Comparison not checked — refresh to try again</span>;
-  if (actionKey === "push") {
-    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Create initial commit & push" : project.git.changeCount ? "Commit & push" : "Push to GitHub";
-    return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={15}/> {label}</button>;
-  }
-  if (actionKey === "up_to_date") return <span className="action-guidance good"><Check size={14}/> Up to date</span>;
-  if (actionKey === "connect_github") return <span className="action-guidance">Connect GitHub above to discover repositories</span>;
-  return <span className="action-guidance">No repository action available</span>;
+function GitColumnAction({ project, busy, onAction }: { project: ProjectRecord; busy: boolean; onAction: (kind: "init", trigger: HTMLElement) => void }) {
+  const git = gitPresentation(project);
+  if (git.key === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Checking local Git…</span>;
+  if (git.key === "not_initialized") return <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onAction("init", event.currentTarget)}><GitBranch size={14}/> Initialize Git</button><small>Creates local .git only</small></div>;
+  if (project.git.metadataSource === "agent_external") return <span className="action-guidance"><Check size={13}/> Agent-managed Git</span>;
+  return null;
+}
+
+function GithubColumnAction({ project, githubAvailable, busy, onModal }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; onModal: (modal: RepoModal) => void }) {
+  const github = githubPresentation(project);
+  if (project.preferences.localOnly) return project.github.repository
+    ? <div className="rail-column-action"><a href={project.github.repository.url} target="_blank" rel="noreferrer">Open repository <ExternalLink size={12}/></a><small>GitHub suggestions hidden by Local only</small></div>
+    : <span className="action-guidance"><Check size={13}/> Local only</span>;
+  if (github.key === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Finding repositories…</span>;
+  if (github.key === "linked") return project.github.repository ? <div className="rail-column-action"><a href={project.github.repository.url} target="_blank" rel="noreferrer">Open repository <ExternalLink size={12}/></a></div> : null;
+  if (project.git.metadataSource === "agent_external") return <div className="rail-column-action">
+    <span className="action-guidance">Create or link this repository through the active coding session</span>
+    {project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open matched repository <ExternalLink size={12}/></a>}
+  </div>;
+  if (github.key === "match_found") return <div className="rail-column-action">
+    {!hasDisconnectedHistory(project) && <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "link", project, trigger: event.currentTarget })}><Github size={14}/> {project.git.isRepository ? "Link repository" : "Initialize & link"}</button>}
+    {project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open matched repository <ExternalLink size={12}/></a>}
+  </div>;
+  if (github.key === "none" && githubAvailable) return <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={14}/> Create repository</button></div>;
+  if (github.key === "sign_in" && !githubAvailable) return <span className="action-guidance">Connect GitHub above to discover repositories</span>;
+  return null;
+}
+
+function SyncColumnAction({ project, busy, onModal }: { project: ProjectRecord; busy: boolean; onModal: (modal: RepoModal) => void }) {
+  const git = gitPresentation(project);
+  const sync = syncPresentation(project);
+  const externallyManaged = project.git.metadataSource === "agent_external";
+  let action: React.ReactNode = null;
+  if (sync.key === "history_mismatch") action = <span className="action-guidance danger"><AlertCircle size={13}/> Review the evidence below before pushing</span>;
+  else if (sync.key === "checking") action = <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Comparing refs…</span>;
+  else if (sync.key === "behind" || sync.key === "diverged") action = <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
+  else if (git.key === "offloaded" || git.key === "not_checked") action = <span className="action-guidance">Make working files available, then refresh</span>;
+  else if (sync.key === "not_checked") action = <span className="action-guidance">Refresh to check the comparison again</span>;
+  else if (externallyManaged && (git.key === "changes" || git.key === "no_commits" || sync.key === "ahead" || sync.key === "not_pushed")) action = <span className="action-guidance caution">Commit and push through the active coding session</span>;
+  else if (project.github.state === "linked" && (git.key === "no_commits" || git.key === "changes" || sync.key === "ahead" || sync.key === "not_pushed")) {
+    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Initial commit & push" : project.git.changeCount ? "Commit & push" : "Push to GitHub";
+    action = <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={14}/> {label}</button></div>;
+  } else if (sync.key === "in_sync") action = <span className="action-guidance good"><Check size={13}/> Up to date</span>;
+  else if (sync.key === "not_linked" && project.github.state === "matched") action = <span className="action-guidance">Link the repository in the GitHub column</span>;
+  return <>{action}<StatusEvidence project={project}/></>;
 }
 
 function StatusEvidence({ project }: { project: ProjectRecord }) {
@@ -168,7 +194,7 @@ function StatusEvidence({ project }: { project: ProjectRecord }) {
   return <details className="status-evidence" open={hasDisconnectedHistory(project) || undefined}>
     <summary>Status evidence</summary>
     <dl>
-      <div><dt>Local Git</dt><dd>{git.label}. {git.detail}</dd></div>
+      <div><dt>Local Git</dt><dd>{project.git.metadataSource === "agent_external" ? "Agent-managed external Git metadata. " : ""}{git.label}. {git.detail}</dd></div>
       <div><dt>Origin</dt><dd>{project.github.state === "linked" ? repository?.nameWithOwner || "GitHub origin configured" : "No origin remote is configured in this folder"}</dd></div>
       <div><dt>GitHub</dt><dd>{repository ? `${repository.nameWithOwner} · latest push ${exactTimestamp(repository.pushedAt)}` : github.detail}</dd></div>
       <div><dt>Comparison</dt><dd>{sync.detail}</dd></div>
@@ -189,16 +215,16 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
       </div>
       <div className="project-facts"><div><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong></div><div><span>Latest Git activity:</span><time dateTime={update.at || undefined} title={update.exact} aria-label={`Latest Git activity: ${update.relative}. ${update.source}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time><small className="activity-source">{update.source}</small></div>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
       <div className="repository-rail" aria-label={`Repository state for ${project.name}`}>
-        <div className={`rail-stop ${git.tone}`} data-state-key={git.key}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{refreshingDetail(git.detail, git.refreshing)}</small></div>
-        <div className={`rail-stop ${github.tone}`} data-state-key={github.key}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{refreshingDetail(github.detail, github.refreshing)}</small></div>
-        <div className={`rail-stop ${sync.tone}`} data-state-key={sync.key}><span><SyncIcon className={sync.key === "checking" ? "spin" : undefined} size={14}/> Sync</span><strong>{sync.label}</strong><small>{refreshingDetail(sync.detail, sync.refreshing)}</small></div>
+        <div className={`rail-stop ${git.tone}`} data-state-key={git.key}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{refreshingDetail(git.detail, git.refreshing)}</small><GitColumnAction project={project} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)}/></div>
+        <div className={`rail-stop ${github.tone}`} data-state-key={github.key}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{refreshingDetail(github.detail, github.refreshing)}</small><GithubColumnAction project={project} githubAvailable={githubAvailable} busy={busy} onModal={onModal}/></div>
+        <div className={`rail-stop ${sync.tone}`} data-state-key={sync.key}><span><SyncIcon className={sync.key === "checking" ? "spin" : undefined} size={14}/> Sync</span><strong>{sync.label}</strong><small>{refreshingDetail(sync.detail, sync.refreshing)}</small><SyncColumnAction project={project} busy={busy} onModal={onModal}/></div>
       </div>
-      <div className="record-actions" aria-label={`Actions for ${project.name}`}>{actionError?.projectPath === project.canonicalPath && <div className="project-action-error" role="alert"><strong>{actionError.label} failed for {project.name}</strong><p>{actionError.message}</p><button onClick={onDismissActionError}>Dismiss</button></div>}<div className="primary-action"><ProjectActions project={project} githubAvailable={githubAvailable} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)} onModal={onModal}/></div><div className="record-utilities">{project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open GitHub repository <ExternalLink size={13}/></a>}<StatusEvidence project={project}/></div></div>
+      {actionError?.projectPath === project.canonicalPath && <div className="project-action-error row-action-error" role="alert"><strong>{actionError.label} failed for {project.name}</strong><p>{actionError.message}</p><button onClick={onDismissActionError}>Dismiss</button></div>}
     </article>
   </li>;
 }
 
-function Skeleton() { return <li className="project-row skeleton" aria-hidden="true"><div className="sk sk-wide"/><div className="sk"/><div className="sk sk-rail"/><div className="sk"/></li>; }
+function Skeleton() { return <li className="project-row skeleton" aria-hidden="true"><div className="sk sk-wide"/><div className="sk"/><div className="sk sk-rail"/></li>; }
 
 function LedgerColumns({ sortKey, sortDirection, onSort }: { sortKey: SortKey; sortDirection: SortDirection; onSort: (key: SortKey) => void }) {
   return <div className="ledger-columns" aria-label="Sortable project columns">
@@ -210,7 +236,6 @@ function LedgerColumns({ sortKey, sortDirection, onSort }: { sortKey: SortKey; s
         <span>{sortLabels[key]}</span>{active && (sortDirection === "asc" ? <ArrowUp size={14} aria-hidden="true"/> : <ArrowDown size={14} aria-hidden="true"/>)}
       </button>;
     })}
-    <span className="action-column-label">Action</span>
   </div>;
 }
 
@@ -244,7 +269,7 @@ export function ProjectDashboard() {
   const updateProject = useCallback((project: ProjectRecord, scannedAt = new Date().toISOString()) => setData((current) => current ? { ...current, scannedAt, projects: current.projects.map((item) => item.canonicalPath === project.canonicalPath ? project : item) } : current), []);
   const focusProjectAction = useCallback((projectPath: string) => {
     const row = [...document.querySelectorAll<HTMLElement>("[data-project-path]")].find((item) => item.dataset.projectPath === projectPath);
-    row?.querySelector<HTMLElement>(".primary-action button, .project-action-error button")?.focus();
+    row?.querySelector<HTMLElement>(".rail-column-action button, .project-action-error button")?.focus();
   }, []);
   const action = useCallback(async (project: ProjectRecord, kind: ProjectActionKind, payload: Record<string, unknown> = {}, directTrigger: HTMLElement | null = null) => {
     if (busyProject) return;

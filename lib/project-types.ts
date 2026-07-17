@@ -65,6 +65,9 @@ export interface ProjectRecord {
     /** Why working-tree enumeration did not complete. Repository identity,
      * branch, commits, and origin remain independently trustworthy. */
     statusReason?: "offloaded" | "timeout" | "error" | null;
+    /** Where Git metadata was resolved. Agent-managed metadata is discovered
+     * by its core.worktree pointer when Codex/Claude use an external GIT_DIR. */
+    metadataSource?: "folder" | "linked_worktree" | "agent_external";
     lastCommitAt: string | null;
     lastCommitMessage: string | null;
   };

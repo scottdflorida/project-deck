@@ -192,6 +192,16 @@ test("action guidance never calls an unchecked working tree up to date", () => {
   assert.equal(projectActionKey(offloaded, true), "working_tree_not_checked");
 });
 
+test("agent-managed Git is labeled truthfully and routes mutations back to the coding session", () => {
+  const external = project("agent-project", {
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, metadataSource: "agent_external", lastCommitAt: "2026-07-17T10:00:00.000Z", lastCommitMessage: "Agent update" },
+    sync: { state: "ahead", ahead: 1, behind: 0, checkedRemote: true, detail: "1 local commit ready to push." },
+  });
+  assert.match(gitPresentation(external).detail, /agent-managed Git metadata/);
+  assert.equal(projectActionKey(external, true), "external_session");
+  assert.equal(hasDisconnectedHistory(external), false);
+});
+
 test("categorical sorting groups exact displayed states and keeps unresolved states last", () => {
   const values = [
     project("clean-z"),

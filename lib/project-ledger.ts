@@ -27,7 +27,8 @@ export const syncRanks: readonly SyncPresentationKey[] = ["not_linked", "history
 type SortProjection = { bucket: 0 | 1 | 2; rank: number; count: number };
 
 function branchDetail(project: ProjectRecord) {
-  return project.git.branch || "Detached HEAD";
+  const branch = project.git.branch || "Detached HEAD";
+  return project.git.metadataSource === "agent_external" ? `${branch} · agent-managed Git metadata` : branch;
 }
 
 function validTimestamp(value: string | null | undefined) {
@@ -110,7 +111,7 @@ export function syncPresentation(project: ProjectRecord): StatePresentation<Sync
   return { key: "not_checked", label: "Comparison not checked", detail: project.sync.detail || "The linked refs could not be compared.", tone: "quiet", resolution: "not_checked", actionable: false, refreshing: false, count: 0 };
 }
 
-export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "reconcile" | "review_history" | "working_tree_not_checked" | "comparison_not_checked" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
+export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "reconcile" | "review_history" | "working_tree_not_checked" | "comparison_not_checked" | "external_session" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
 
 export function projectActionKey(project: ProjectRecord, githubAvailable: boolean): ProjectActionKey {
   const git = gitPresentation(project);
@@ -119,6 +120,7 @@ export function projectActionKey(project: ProjectRecord, githubAvailable: boolea
   if (git.key === "checking") return "checking_git";
   if (project.preferences.localOnly) return git.key === "not_initialized" ? "init" : "local_only";
   if (sync.key === "history_mismatch") return "review_history";
+  if (project.git.metadataSource === "agent_external" && (git.key === "changes" || git.key === "no_commits" || github.actionable || sync.actionable)) return "external_session";
   if (git.key === "not_initialized") return github.key === "match_found" ? "link" : "init";
   if (github.key === "match_found") return "link";
   if (github.key === "none" && githubAvailable) return "create";

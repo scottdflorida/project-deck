@@ -12,7 +12,7 @@ import {
   getGithubAuthentication,
   getProjectsRoot,
   openProjectsRoot,
-  scanProjects,
+  scanProjectsProgressively,
   scanProjectsQuick,
   setProjectsRoot,
   setProjectPreferences,
@@ -21,12 +21,11 @@ import {
 
 const port = Number.parseInt(process.env.GIT_SCAN_API_PORT || "4317", 10);
 const SCAN_CACHE_MS = 10 * 60_000;
-type ScanResult = Awaited<ReturnType<typeof scanProjects>>;
+type ScanResult = Awaited<ReturnType<typeof scanProjectsProgressively>>;
 let scanCache: { createdAt: number; value: ScanResult } | null = null;
 let quickScanCache: ScanResult | null = null;
 let quickScanInFlight: Promise<ScanResult> | null = null;
 let quickSizeScanInFlight: Promise<ScanResult> | null = null;
-const scansInFlight = new Map<string, Promise<ScanResult>>();
 let scanGeneration = 0;
 let lastAuthenticatedGithubLogin: string | null = null;
 let githubAuthenticationChecked = false;
@@ -37,22 +36,6 @@ function invalidateScanCaches(preserveQuick = false) {
   if (!preserveQuick) quickScanCache = null;
   quickScanInFlight = null;
   quickSizeScanInFlight = null;
-  scansInFlight.clear();
-}
-
-function startDeepScan(refreshRemote: boolean, generation: number) {
-  const key = `${generation}:${refreshRemote ? "remote" : "local"}`;
-  const existing = scansInFlight.get(key);
-  if (existing) return existing;
-
-  const scan = scanProjects(refreshRemote)
-    .then((value) => {
-      if (generation === scanGeneration) scanCache = { createdAt: Date.now(), value };
-      return value;
-    })
-    .finally(() => scansInFlight.delete(key));
-  scansInFlight.set(key, scan);
-  return scan;
 }
 
 async function getProjectScan(refreshRemote: boolean) {
@@ -92,19 +75,24 @@ async function getProjectScan(refreshRemote: boolean) {
 
 function startQuickSizeScan(generation: number, fallback: ScanResult, refreshRemote = false) {
   if (quickSizeScanInFlight) return quickSizeScanInFlight;
-  const sizeScan = scanProjectsQuick(true, (factsValue) => {
+  const sizeScan = scanProjectsProgressively(refreshRemote, fallback, (factsValue) => {
     if (generation === scanGeneration) quickScanCache = factsValue;
   })
     .then((sizedValue) => {
       if (generation === scanGeneration) {
         quickScanCache = sizedValue;
-        void startDeepScan(refreshRemote, generation).catch(() => undefined);
+        scanCache = { createdAt: Date.now(), value: sizedValue };
       }
       return sizedValue;
     })
     .catch(() => {
-      if (generation === scanGeneration) void startDeepScan(refreshRemote, generation).catch(() => undefined);
-      return fallback;
+      const settledFallback = {
+        ...fallback,
+        enriching: false,
+        projects: fallback.projects.map((project) => ({ ...project, transient: undefined })),
+      };
+      if (generation === scanGeneration) quickScanCache = settledFallback;
+      return settledFallback;
     });
   quickSizeScanInFlight = sizeScan;
   void sizeScan.finally(() => {

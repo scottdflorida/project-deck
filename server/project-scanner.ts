@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, lstat, open, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { homedir, platform, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
@@ -23,6 +23,12 @@ const SIZE_ERROR: ProjectSize = {
   code: "measurement_failed",
   message: "Size unavailable because part of this folder could not be read.",
 };
+
+/** A transient read failure must not erase a size that was already measured
+ * successfully on this machine. */
+export function preserveKnownProjectSize(previous: ProjectSize, measured: ProjectSize) {
+  return measured.status === "error" && previous.status === "complete" ? previous : measured;
+}
 
 function gitStatusTimeoutMs() {
   const configured = Number.parseInt(process.env.GIT_SCAN_STATUS_TIMEOUT_MS || "3500", 10);
@@ -104,6 +110,8 @@ type LocalGitMetadata = {
   branch: string | null;
   hasCommits: boolean;
   origin: string;
+  gitDir: string | null;
+  source: "folder" | "linked_worktree" | "agent_external";
 };
 
 const EMPTY_LOCAL_GIT: LocalGitMetadata = {
@@ -111,6 +119,8 @@ const EMPTY_LOCAL_GIT: LocalGitMetadata = {
   branch: null,
   hasCommits: false,
   origin: "",
+  gitDir: null,
+  source: "folder",
 };
 const GIT_OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/iu;
 
@@ -121,6 +131,16 @@ type GithubContext = {
   byName: Map<string, GithubRepository>;
   byFullName: Map<string, GithubRepository>;
 };
+
+function unavailableGithubContext(): GithubContext {
+  return {
+    available: false,
+    login: null,
+    repositories: [],
+    byName: new Map(),
+    byFullName: new Map(),
+  };
+}
 
 let githubContextCache: { createdAt: number; value: GithubContext } | null = null;
 let githubContextInFlight: Promise<GithubContext> | null = null;
@@ -421,6 +441,65 @@ function resolveGitMetadataPath(base: string, value: string) {
   return path.isAbsolute(value) ? path.normalize(value) : path.resolve(base, value);
 }
 
+function worktreeFromGitConfig(contents: string) {
+  return contents.match(/\[core\][\s\S]*?^\s*worktree\s*=\s*(.+)$/mu)?.[1]?.trim() || "";
+}
+
+function externalGitSearchRoots() {
+  const configured = (process.env.GIT_SCAN_EXTERNAL_GIT_ROOTS || "")
+    .split(path.delimiter)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const defaults = [
+    tmpdir(),
+    ...(platform() === "darwin" ? ["/private/tmp"] : []),
+    path.join(homedir(), ".codex", "worktrees"),
+    path.join(homedir(), ".claude", "worktrees"),
+  ];
+  return [...new Set([...configured, ...defaults].map((value) => path.resolve(value)))];
+}
+
+async function findGitDirectories(searchRoot: string, maxDepth = 3, maxDirectories = 2_500) {
+  const found: string[] = [];
+  const pending = [{ directory: searchRoot, depth: 0 }];
+  let visited = 0;
+  while (pending.length && visited < maxDirectories) {
+    const current = pending.pop()!;
+    visited += 1;
+    const entries = await readdir(current.directory, { withFileTypes: true }).catch(() => []);
+    const names = new Set(entries.map((entry) => entry.name));
+    if (names.has("HEAD") && names.has("config") && names.has("objects")) {
+      found.push(current.directory);
+      continue;
+    }
+    if (current.depth >= maxDepth) continue;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      if (["node_modules", "objects", ".next", "dist"].includes(entry.name)) continue;
+      pending.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
+    }
+  }
+  return found;
+}
+
+/** Reverse-map bounded agent/temp Git databases through core.worktree. Standard
+ * Git worktrees remain handled by their in-folder .git pointer. */
+export async function discoverExternalGitDirectories(projectPaths: string[]) {
+  const wanted = new Set(await Promise.all(projectPaths.map(async (projectPath) =>
+    realpath(projectPath).catch(() => path.resolve(projectPath)))));
+  const roots = externalGitSearchRoots();
+  const candidates = (await Promise.all(roots.map((root) => findGitDirectories(root)))).flat();
+  const matches = new Map<string, string>();
+  await mapWithConcurrency(candidates, 16, async (gitDir) => {
+    const contents = await readFile(path.join(gitDir, "config"), "utf8").catch(() => "");
+    const configuredWorktree = worktreeFromGitConfig(contents);
+    if (!configuredWorktree) return;
+    const canonicalWorktree = await realpath(configuredWorktree).catch(() => path.resolve(configuredWorktree));
+    if (wanted.has(canonicalWorktree)) matches.set(canonicalWorktree, gitDir);
+  });
+  return matches;
+}
+
 /**
  * Read the tiny files that define repository identity without starting Git.
  * Large project inventories can otherwise launch hundreds of Git processes at
@@ -428,19 +507,22 @@ function resolveGitMetadataPath(base: string, value: string) {
  * processes hit their deadline. Command reads are bounded on Unix; Windows
  * uses the equivalent filesystem representation.
  */
-async function readLocalGitMetadata(root: string, projectPath: string): Promise<LocalGitMetadata> {
+async function readLocalGitMetadata(root: string, projectPath: string, externalGitDir?: string): Promise<LocalGitMetadata> {
   const dotGitPath = path.join(projectPath, ".git");
 
   if (platform() !== "win32") {
-    const dotGitListing = await run("ls", ["-ld", dotGitPath], root, 800);
+    const metadataPath = externalGitDir || dotGitPath;
+    const dotGitListing = await run("ls", ["-ld", metadataPath], root, 800);
     if (!dotGitListing.ok) return { ...EMPTY_LOCAL_GIT };
 
-    let gitDir = dotGitPath;
-    if (!dotGitListing.stdout.startsWith("d")) {
+    let gitDir = metadataPath;
+    let source: LocalGitMetadata["source"] = externalGitDir ? "agent_external" : "folder";
+    if (!externalGitDir && !dotGitListing.stdout.startsWith("d")) {
       const pointer = await run("head", ["-c", "4096", dotGitPath], root, 1_200);
       const target = pointer.stdout.match(/^gitdir:\s*(.+)$/imu)?.[1]?.trim();
       if (!pointer.ok || !target) return { ...EMPTY_LOCAL_GIT };
       gitDir = resolveGitMetadataPath(projectPath, target);
+      source = "linked_worktree";
     }
 
     const [headResult, commonDirResult] = await Promise.all([
@@ -468,6 +550,28 @@ async function readLocalGitMetadata(root: string, projectPath: string): Promise<
       branch: head.branch,
       hasCommits,
       origin: configResult.ok ? originFromGitConfig(configResult.stdout) : "",
+      gitDir,
+      source,
+    };
+  }
+
+  if (externalGitDir) {
+    const [headContents, configContents] = await Promise.all([
+      readFile(path.join(externalGitDir, "HEAD"), "utf8").catch(() => ""),
+      readFile(path.join(externalGitDir, "config"), "utf8").catch(() => ""),
+    ]);
+    const head = gitHeadFacts(headContents);
+    const [refContents, packedRefsContents] = await Promise.all([
+      head.ref ? readFile(path.join(externalGitDir, head.ref), "utf8").catch(() => "") : "",
+      head.ref ? readFile(path.join(externalGitDir, "packed-refs"), "utf8").catch(() => "") : "",
+    ]);
+    return {
+      isRepository: Boolean(headContents),
+      branch: head.branch,
+      hasCommits: head.hasCommits || GIT_OBJECT_ID.test(refContents.trim()) || Boolean(head.ref && packedRefsContain(packedRefsContents, head.ref)),
+      origin: originFromGitConfig(configContents),
+      gitDir: externalGitDir,
+      source: "agent_external",
     };
   }
 
@@ -478,11 +582,13 @@ async function readLocalGitMetadata(root: string, projectPath: string): Promise<
     return { ...EMPTY_LOCAL_GIT };
   }
   let gitDir = dotGitPath;
+  let source: LocalGitMetadata["source"] = "folder";
   if (!dotGitStat.isDirectory()) {
     const pointer = await readFile(dotGitPath, "utf8").catch(() => "");
     const target = pointer.match(/^gitdir:\s*(.+)$/imu)?.[1]?.trim();
     if (!target) return { ...EMPTY_LOCAL_GIT };
     gitDir = resolveGitMetadataPath(projectPath, target);
+    source = "linked_worktree";
   }
   const commonDirValue = await readFile(path.join(gitDir, "commondir"), "utf8").catch(() => "");
   const commonDir = commonDirValue.trim()
@@ -502,7 +608,29 @@ async function readLocalGitMetadata(root: string, projectPath: string): Promise<
     branch: head.branch,
     hasCommits: head.hasCommits || GIT_OBJECT_ID.test(refContents.trim()) || Boolean(head.ref && packedRefsContain(packedRefsContents, head.ref)),
     origin: originFromGitConfig(configContents),
+    gitDir,
+    source,
   };
+}
+
+async function resolveProjectGitMetadata(root: string, projectPath: string, externalGitDirs?: Map<string, string>) {
+  const local = await readLocalGitMetadata(root, projectPath);
+  const canonicalPath = await realpath(projectPath).catch(() => path.resolve(projectPath));
+  const externalGitDir = externalGitDirs?.get(canonicalPath);
+  if (!externalGitDir) return local;
+  const external = await readLocalGitMetadata(root, projectPath, externalGitDir);
+  if (external.isRepository && external.hasCommits && (!local.isRepository || !local.hasCommits)) return external;
+  return local;
+}
+
+function projectGitArgs(projectPath: string, metadata: LocalGitMetadata | undefined, args: string[]) {
+  return metadata?.source === "agent_external" && metadata.gitDir
+    ? ["--git-dir", metadata.gitDir, "--work-tree", projectPath, ...args]
+    : args;
+}
+
+function runProjectGit(projectPath: string, metadata: LocalGitMetadata | undefined, args: string[], timeoutMs?: number) {
+  return run("git", projectGitArgs(projectPath, metadata, args), projectPath, timeoutMs);
 }
 
 /**
@@ -519,7 +647,7 @@ export function includesTrackedOffloadedPath(projectPath: string, offloadedOutpu
     .some((filePath) => trackedPaths.has(path.relative(projectPath, filePath)));
 }
 
-async function hasTrackedOffloadedWorkingFiles(root: string, projectPath: string) {
+async function hasTrackedOffloadedWorkingFiles(root: string, projectPath: string, gitMetadata?: LocalGitMetadata) {
   if (platform() !== "darwin") return false;
   const [offloaded, tracked] = await Promise.all([
     run(
@@ -528,7 +656,7 @@ async function hasTrackedOffloadedWorkingFiles(root: string, projectPath: string
       root,
       1_200,
     ),
-    run("git", ["ls-files", "-z"], projectPath, 1_200),
+    runProjectGit(projectPath, gitMetadata, ["ls-files", "-z"], 1_200),
   ]);
   if (!offloaded.ok || !tracked.ok || !offloaded.stdout || !tracked.stdout) return false;
   return includesTrackedOffloadedPath(projectPath, offloaded.stdout, tracked.stdout);
@@ -941,6 +1069,7 @@ export async function getSyncState(
   hasCommits: boolean,
   hasGithubRemote: boolean,
   refreshRemote: boolean,
+  gitMetadata?: LocalGitMetadata,
 ) {
   if (!hasGithubRemote) {
     const state: SyncState = "no_remote";
@@ -959,42 +1088,21 @@ export async function getSyncState(
 
   let checkedRemote = false;
   if (refreshRemote) {
-    const fetched = await run(
-      "git",
-      ["fetch", "--quiet", "--prune", "origin"],
-      projectPath,
-      8_000,
-    );
+    const fetched = await runProjectGit(projectPath, gitMetadata, ["fetch", "--quiet", "--prune", "origin"], 8_000);
     checkedRemote = fetched.ok;
   }
 
-  let comparison = await run(
-    "git",
-    ["rev-list", "--left-right", "--count", `origin/${branch}...HEAD`],
-    projectPath,
-  );
+  let comparison = await runProjectGit(projectPath, gitMetadata, ["rev-list", "--left-right", "--count", `origin/${branch}...HEAD`]);
 
   if (!comparison.ok) {
-    const upstream = await run(
-      "git",
-      ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-      projectPath,
-    );
+    const upstream = await runProjectGit(projectPath, gitMetadata, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
     if (upstream.ok) {
-      comparison = await run(
-        "git",
-        ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
-        projectPath,
-      );
+      comparison = await runProjectGit(projectPath, gitMetadata, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]);
     }
   }
 
   if (!comparison.ok) {
-    const remoteBranch = await run(
-      "git",
-      ["show-ref", "--verify", `refs/remotes/origin/${branch}`],
-      projectPath,
-    );
+    const remoteBranch = await runProjectGit(projectPath, gitMetadata, ["show-ref", "--verify", `refs/remotes/origin/${branch}`]);
     const state: SyncState = remoteBranch.ok ? "unavailable" : "unpublished";
     return {
       state,
@@ -1027,18 +1135,19 @@ async function scanProject(
   name: string,
   github: GithubContext,
   refreshRemote: boolean,
+  options: { skipSize?: boolean; size?: ProjectSize; description?: ProjectDescription; externalGitDirs?: Map<string, string> } = {},
 ): Promise<ProjectRecord> {
   const projectPath = path.join(root, name);
   const canonicalPath = await canonicalizeProjectPath(projectPath);
   const [entries, projectStat, size, gitMetadata] = await Promise.all([
     readdir(projectPath, { withFileTypes: true }).catch(() => []),
     stat(projectPath),
-    measureProjectSizeForScan(projectPath, root),
-    readLocalGitMetadata(root, projectPath),
+    options.size ? Promise.resolve(options.size) : options.skipSize ? Promise.resolve({ ...SIZE_ERROR }) : measureProjectSizeForScan(projectPath, root),
+    resolveProjectGitMetadata(root, projectPath, options.externalGitDirs),
   ]);
   const names = entries.map((entry) => entry.name);
   const projectPreference = preferenceFor(canonicalPath);
-  const description = await discoverProjectDescription(projectPath, names, projectPreference.description);
+  const description = options.description || await discoverProjectDescription(projectPath, names, projectPreference.description);
   const technologies = detectTechnologies(names);
   const isRepository = gitMetadata.isRepository;
 
@@ -1060,6 +1169,7 @@ async function scanProject(
         hasCommits: false,
         changeCount: 0,
         statusAvailable: true,
+        metadataSource: gitMetadata.source,
         lastCommitAt: null,
         lastCommitMessage: null,
       },
@@ -1077,21 +1187,17 @@ async function scanProject(
     };
   }
 
-  const offloadedWorkingFiles = await hasTrackedOffloadedWorkingFiles(root, projectPath);
+  const offloadedWorkingFiles = await hasTrackedOffloadedWorkingFiles(root, projectPath, gitMetadata);
   const statusPromise = offloadedWorkingFiles
     ? Promise.resolve({ ok: false, stdout: "", stderr: "Working files are offloaded to iCloud.", exitCode: null, timedOut: false } satisfies CommandResult)
-    : run("git", ["status", "--porcelain", "--untracked-files=normal"], projectPath, gitStatusTimeoutMs());
+    : runProjectGit(projectPath, gitMetadata, ["status", "--porcelain", "--untracked-files=normal"], gitStatusTimeoutMs());
   const [branchResult, statusResult, headResult, originResult, lastCommitResult] =
     await Promise.all([
-      run("git", ["branch", "--show-current"], projectPath),
+      runProjectGit(projectPath, gitMetadata, ["branch", "--show-current"]),
       statusPromise,
-      run("git", ["rev-parse", "HEAD"], projectPath),
-      run("git", ["remote", "get-url", "origin"], projectPath),
-      run(
-        "git",
-        ["log", "-1", "--format=%cI%x00%s"],
-        projectPath,
-      ),
+      runProjectGit(projectPath, gitMetadata, ["rev-parse", "HEAD"]),
+      runProjectGit(projectPath, gitMetadata, ["remote", "get-url", "origin"]),
+      runProjectGit(projectPath, gitMetadata, ["log", "-1", "--format=%cI%x00%s"]),
     ]);
 
   const branch = branchResult.ok && branchResult.stdout ? branchResult.stdout : gitMetadata.branch;
@@ -1121,6 +1227,7 @@ async function scanProject(
     hasCommits,
     Boolean(remote),
     refreshRemote,
+    gitMetadata,
   );
 
   return {
@@ -1140,6 +1247,7 @@ async function scanProject(
       changeCount,
       statusAvailable: statusResult.ok,
       statusReason: statusResult.ok ? null : offloadedWorkingFiles ? "offloaded" : statusResult.timedOut ? "timeout" : "error",
+      metadataSource: gitMetadata.source,
       lastCommitAt: lastCommitParts[0] || null,
       lastCommitMessage: lastCommitParts[1] || null,
     },
@@ -1176,19 +1284,21 @@ async function mapWithConcurrency<T, U>(
 
 export async function scanProjects(refreshRemote = false): Promise<ProjectScanResponse> {
   const root = getProjectsRoot();
-  const [entries, github] = await Promise.all([
-    readdir(root, { withFileTypes: true }),
-    getGithubContext(root),
-  ]);
+  const entries = await readdir(root, { withFileTypes: true });
   const folderNames = entries
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const projectPaths = folderNames.map((name) => path.join(root, name));
+  const [github, externalGitDirs] = await Promise.all([
+    getGithubContext(root),
+    discoverExternalGitDirectories(projectPaths),
+  ]);
   // Git itself fans out over index/worktree I/O. A conservative pool avoids
   // making healthy repositories miss their deadline while a slow folder still
   // times out independently.
   const projects = await mapWithConcurrency(folderNames, 4, (name) =>
-    scanProject(root, name, github, refreshRemote),
+    scanProject(root, name, github, refreshRemote, { externalGitDirs }),
   );
 
   return {
@@ -1201,6 +1311,175 @@ export async function scanProjects(refreshRemote = false): Promise<ProjectScanRe
     },
     projects,
   };
+}
+
+/**
+ * Enrich a usable inventory without coupling independent subsystems. Git facts
+ * and sizes run in separate bounded pools and every completed project is
+ * published immediately. A failed refresh never replaces a known good size.
+ */
+export async function scanProjectsProgressively(
+  refreshRemote = false,
+  previous?: ProjectScanResponse,
+  onFacts?: (value: ProjectScanResponse) => void,
+): Promise<ProjectScanResponse> {
+  const root = getProjectsRoot();
+  const entries = await readdir(root, { withFileTypes: true });
+  const folderNames = entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const base = previous || await scanProjectsQuick(false);
+  const previousByName = new Map(base.projects.map((project) => [project.name, project]));
+  const projectPaths = folderNames.map((name) => path.join(root, name));
+  const githubPromise = getGithubContext(root);
+  const externalGitDirsPromise = discoverExternalGitDirectories(projectPaths);
+  let github = unavailableGithubContext();
+  let githubSettled = false;
+
+  const projects: ProjectRecord[] = folderNames.map((name): ProjectRecord => {
+    const existing = previousByName.get(name);
+    if (existing) {
+      return {
+        ...existing,
+        transient: {
+          git: "checking" as const,
+          github: "checking" as const,
+          sync: "checking" as const,
+          ...(existing.size.status === "complete" ? {} : { size: "checking" as const }),
+        },
+      };
+    }
+    const projectPath = path.join(root, name);
+    const projectPreference = preferenceFor(projectPath);
+    return {
+      name,
+      canonicalPath: projectPath,
+      pathLabel: `${rootLabel(root)}/${name}`,
+      description: { text: "", compact: "", source: "checking", sourceLabel: "Checking local description…", sourceFile: null },
+      summary: "",
+      preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
+      technologies: [],
+      modifiedAt: new Date().toISOString(),
+      size: { ...SIZE_ERROR },
+      git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, metadataSource: "folder", lastCommitAt: null, lastCommitMessage: null },
+      github: { state: "unavailable", repository: null },
+      sync: { state: "unavailable", ahead: 0, behind: 0, checkedRemote: false, detail: "Git and GitHub status are still being checked in the background." },
+      transient: { size: "checking", git: "checking", github: "checking", sync: "checking" },
+    };
+  });
+
+  const publish = (enriching: boolean) => {
+    const value: ProjectScanResponse = {
+      rootPath: root,
+      rootLabel: rootLabel(root),
+      scannedAt: new Date().toISOString(),
+      enriching,
+      github: { available: github.available, login: github.login },
+      projects: [...projects],
+    };
+    onFacts?.(value);
+    return value;
+  };
+  publish(true);
+
+  const indexed = folderNames.map((name, index) => ({ name, index }));
+  const applyGithub = (project: ProjectRecord) => {
+    const linkedName = project.github.state === "linked"
+      ? project.github.repository?.nameWithOwner.toLowerCase()
+      : null;
+    const linkedRepository = linkedName
+      ? github.byFullName.get(linkedName) || project.github.repository
+      : null;
+    const matchedRepository = github.byName.get(project.name.toLowerCase()) || null;
+    const transient = { ...project.transient };
+    delete transient.github;
+    return {
+      ...project,
+      github: {
+        state: linkedRepository ? "linked" as const : matchedRepository ? "matched" as const : github.available ? "none" as const : "unavailable" as const,
+        repository: linkedRepository || matchedRepository,
+      },
+      transient: Object.keys(transient).length ? transient : undefined,
+    } satisfies ProjectRecord;
+  };
+
+  const factsWork = mapWithConcurrency(indexed, 4, async ({ name, index }) => {
+    const externalGitDirs = await externalGitDirsPromise;
+    const current = projects[index];
+    const resolved = await scanProject(root, name, github, refreshRemote, {
+      skipSize: true,
+      size: current.size,
+      description: current.description,
+      externalGitDirs,
+    });
+    const sizePending = projects[index].transient?.size === "checking";
+    const nextTransient: ProjectRecord["transient"] = {
+      ...(sizePending ? { size: "checking" as const } : {}),
+      ...(!githubSettled ? { github: "checking" as const } : {}),
+    };
+    const next: ProjectRecord = {
+      ...resolved,
+      size: projects[index].size,
+      description: projects[index].description,
+      summary: projects[index].description.compact,
+      transient: Object.keys(nextTransient).length ? nextTransient : undefined,
+    };
+    projects[index] = github.available ? applyGithub(next) : next;
+    publish(true);
+  });
+
+  const githubWork = (async () => {
+    github = await githubPromise;
+    githubSettled = true;
+    for (let index = 0; index < projects.length; index += 1) {
+      projects[index] = applyGithub(projects[index]);
+    }
+    publish(true);
+  })();
+
+  const descriptionWork = mapWithConcurrency(indexed, 4, async ({ name, index }) => {
+    const projectPath = path.join(root, name);
+    const entries = await readdir(projectPath, { withFileTypes: true }).catch(() => []);
+    const names = entries.map((entry) => entry.name);
+    const projectPreference = preferenceFor(await canonicalizeProjectPath(projectPath));
+    const fallback = projects[index].description.source === "checking"
+      ? { text: "", compact: "", source: "none" as const, sourceLabel: "No suitable local description found", sourceFile: null }
+      : projects[index].description;
+    const description = await settleWithin(
+      platform() === "win32"
+        ? discoverProjectDescription(projectPath, names, projectPreference.description)
+        : discoverProjectDescriptionWithCommands(root, projectPath, names, projectPreference.description),
+      2_500,
+      fallback,
+    );
+    projects[index] = {
+      ...projects[index],
+      description,
+      summary: description.compact,
+    };
+    publish(true);
+  });
+
+  const sizeWork = mapWithConcurrency(indexed, 3, async ({ name, index }) => {
+    const measured = await measureProjectSizeForScan(path.join(root, name), root);
+    const current = projects[index];
+    const size = preserveKnownProjectSize(current.size, measured);
+    const transient = { ...current.transient };
+    delete transient.size;
+    projects[index] = {
+      ...current,
+      size,
+      transient: Object.keys(transient).length ? transient : undefined,
+    };
+    publish(true);
+  });
+
+  await Promise.all([factsWork, githubWork, descriptionWork, sizeWork]);
+  for (let index = 0; index < projects.length; index += 1) {
+    projects[index] = { ...projects[index], transient: undefined };
+  }
+  return publish(false);
 }
 
 /**
@@ -1263,10 +1542,11 @@ export async function scanProjectsQuick(
   }
 
   const githubPromise = getGithubContext(root);
+  const externalGitDirs = await discoverExternalGitDirectories(folderNames.map((name) => path.join(root, name)));
   const fastNow = new Date().toISOString();
   const fastProjects = await mapWithConcurrency(folderNames, 8, async (name) => {
     const projectPath = path.join(root, name);
-    const gitMetadataPromise = readLocalGitMetadata(root, projectPath);
+    const gitMetadataPromise = resolveProjectGitMetadata(root, projectPath, externalGitDirs);
     let modifiedAt = fastNow;
     if (platform() === "win32") {
       const projectStat = await stat(projectPath).catch(() => null);
@@ -1305,6 +1585,7 @@ export async function scanProjectsQuick(
         hasCommits: gitMetadata.hasCommits,
         changeCount: 0,
         statusAvailable: false,
+        metadataSource: gitMetadata.source,
         lastCommitAt: null,
         lastCommitMessage: null,
       },
@@ -1476,6 +1757,18 @@ async function ensureGitRepository(projectPath: string) {
   return true;
 }
 
+async function assertFolderManagedGit(root: string, projectPath: string) {
+  const externalGitDirs = await discoverExternalGitDirectories([projectPath]);
+  const metadata = await resolveProjectGitMetadata(root, projectPath, externalGitDirs);
+  if (metadata.source === "agent_external") {
+    throw new ProjectActionError(
+      "This folder’s active Git history is managed by a coding session outside the folder. Commit, link, or push through that session so Project Deck does not modify a different .git database.",
+      409,
+      { code: "agent_external_git" },
+    );
+  }
+}
+
 async function refreshedProject(name: string) {
   const root = getProjectsRoot();
   const github = await getGithubContext(root);
@@ -1483,7 +1776,8 @@ async function refreshedProject(name: string) {
 }
 
 export async function initializeProject(name: string) {
-  const { projectPath } = await resolveProject(name);
+  const { root, projectPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
   const initialized = await ensureGitRepository(projectPath);
   return {
     message: initialized ? "Git initialized on the main branch." : "This folder is already a Git repository.",
@@ -1493,6 +1787,7 @@ export async function initializeProject(name: string) {
 
 export async function linkMatchedRepository(name: string) {
   const { root, projectPath, canonicalPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
   assertGithubActionAllowed(name, canonicalPath, "linking a repository");
   const github = await getGithubContext(root);
   if (!github.available) {
@@ -1548,6 +1843,7 @@ export async function createGithubRepository(
   visibility: "private" | "public",
 ) {
   const { root, projectPath, canonicalPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
   assertGithubActionAllowed(name, canonicalPath, "creating a GitHub repository");
   const github = await getGithubContext(root);
   if (!github.available) {
@@ -1627,7 +1923,8 @@ type CommitPushOptions = {
 };
 
 export async function commitAndPushProject(name: string, requestedMessage: string, options: CommitPushOptions = {}) {
-  const { projectPath, canonicalPath } = await resolveProject(name);
+  const { root, projectPath, canonicalPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
   assertGithubActionAllowed(name, canonicalPath, "publishing to GitHub");
   const execute = options.execute || run;
   const refresh = options.refresh || refreshedProject;

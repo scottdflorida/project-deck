@@ -12,6 +12,8 @@ actions in one place.
 - Total on-disk size for every project
 - Git status, current branch, recent activity, and working-tree changes; slow or
   iCloud-offloaded working trees are identified without hiding known Git facts
+- Git histories managed by coding agents in an external Git directory, resolved
+  through Git's `core.worktree` metadata and labeled as agent-managed
 - Latest Git activity from the newest local commit or GitHub push, never the
   folder modification time (copying or hydrating a folder does not look like work)
 - Exact-name GitHub matches and linked `origin` repositories
@@ -37,6 +39,10 @@ or GitHub repositories.
 
 ## Available actions
 
+Actions live with the state they affect: initialization under **Git**, repository
+creation/linking/opening under **GitHub**, and publishing or reconciliation
+guidance under **Sync**. There is no separate catch-all action column.
+
 - Initialize a folder as a Git repository on `main`
 - Link an exact-name repository already in your GitHub account
 - Create a private or public GitHub repository
@@ -45,6 +51,12 @@ or GitHub repositories.
 Pushes stop when the remote branch is ahead or diverged. Obvious untracked
 secret files such as `.env`, private keys, and credential JSON files are blocked
 before staging.
+
+When Codex, Claude, or another coding tool uses a separate Git database whose
+`core.worktree` points at the selected project, Project Deck reads that history,
+branch, origin, changes, and sync state. Mutating actions are deliberately routed
+back to the active coding session so the dashboard cannot accidentally change a
+different `.git` database inside the project folder.
 
 ## Requirements
 
@@ -84,9 +96,10 @@ the header to select the parent directory that contains your projects. You can
 use the native macOS folder browser or enter an absolute/`~/` path on any
 platform. The choice is saved locally and is never committed.
 
-Project names render first, local Git repositories and linked remotes follow,
-then sizes and detailed sync checks continue independently in the background.
-One slow folder cannot hold repository discovery behind disk measurement.
+Project names render first. Local Git, GitHub discovery, sync comparisons, and
+per-project size measurements then publish independently in the background.
+One slow or offloaded folder cannot hold healthy repositories behind its disk or
+Git check, and a failed refresh keeps the last successfully measured size.
 
 The header always shows the active parent folder. Use **Open** to reveal it in
 the system file browser or **Change** to select another parent. Selecting the
@@ -118,6 +131,9 @@ variables are useful for development, testing, and managed installations:
 - `GIT_SCAN_ROOT`: project root to scan instead of `~/Documents`
 - `GIT_SCAN_API_PORT`: local service port instead of `4317`
 - `GIT_SCAN_DISABLE_GITHUB=1`: skip GitHub CLI discovery
+- `GIT_SCAN_EXTERNAL_GIT_ROOTS`: additional path-delimited roots to search for
+  agent-managed Git directories (temporary Codex/Claude locations are checked
+  automatically with bounded traversal)
 
 ## Checks
 

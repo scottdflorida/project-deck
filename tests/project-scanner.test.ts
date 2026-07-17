@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, ProjectActionError, scanProjects, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -141,7 +141,15 @@ test("one slow Git worktree times out without corrupting a healthy repository", 
     execFileSync("git", ["config", "core.fsmonitor", monitor], { cwd: slow });
     await loadProjectsRoot();
 
-    const result = await scanProjects(false);
+    const initial = await scanProjectsQuick(false);
+    let healthyPublishedWhileSlowPending = false;
+    const result = await scanProjectsProgressively(false, initial, (response) => {
+      const healthySnapshot = response.projects.find((project) => project.name === "healthy");
+      const slowSnapshot = response.projects.find((project) => project.name === "slow");
+      if (!healthySnapshot?.transient?.git && slowSnapshot?.transient?.git === "checking") {
+        healthyPublishedWhileSlowPending = true;
+      }
+    });
     const healthyProject = result.projects.find((project) => project.name === "healthy");
     const slowProject = result.projects.find((project) => project.name === "slow");
     assert.equal(healthyProject?.git.statusAvailable, true);
@@ -149,12 +157,71 @@ test("one slow Git worktree times out without corrupting a healthy repository", 
     assert.equal(slowProject?.git.statusAvailable, false);
     assert.equal(slowProject?.git.statusReason, "timeout");
     assert.equal(slowProject?.git.hasCommits, true);
+    assert.equal(healthyPublishedWhileSlowPending, true);
   } finally {
     if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
     if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
     if (oldTimeout === undefined) delete process.env.GIT_SCAN_STATUS_TIMEOUT_MS; else process.env.GIT_SCAN_STATUS_TIMEOUT_MS = oldTimeout;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("discovers agent-managed external Git metadata by its worktree and blocks unsafe folder-local actions", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-agent-git-test-"));
+  const searchRoot = await mkdtemp(path.join(tmpdir(), "project-agent-git-dirs-"));
+  const oldRoot = process.env.GIT_SCAN_ROOT;
+  const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  const oldExternalRoots = process.env.GIT_SCAN_EXTERNAL_GIT_ROOTS;
+  process.env.GIT_SCAN_ROOT = root;
+  process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  process.env.GIT_SCAN_EXTERNAL_GIT_ROOTS = searchRoot;
+  try {
+    const project = path.join(root, "agent-project");
+    const externalGitDir = path.join(searchRoot, "agent-project-git");
+    await mkdir(project);
+    await writeFile(path.join(project, "README.md"), "Agent-managed project\n");
+    execFileSync("git", ["init", "--separate-git-dir", externalGitDir, "-b", "main"], { cwd: project });
+    execFileSync("git", ["config", "user.name", "Project Deck Test"], { cwd: project });
+    execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: project });
+    execFileSync("git", ["add", "README.md"], { cwd: project });
+    execFileSync("git", ["commit", "-m", "Agent-authored commit"], { cwd: project });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/example/agent-project.git"], { cwd: project });
+    execFileSync("git", ["--git-dir", externalGitDir, "config", "core.worktree", project]);
+
+    // Reproduce the active lifting layout: an empty .git folder exists in the
+    // worktree while the coding agent's real history lives elsewhere.
+    await rm(path.join(project, ".git"), { force: true });
+    execFileSync("git", ["init", "-b", "main"], { cwd: project });
+    await loadProjectsRoot();
+
+    const mappings = await discoverExternalGitDirectories([project]);
+    assert.equal(mappings.get(await canonicalizeProjectPath(project)), externalGitDir);
+    const result = await scanProjects(false);
+    const scanned = result.projects[0];
+    assert.equal(scanned.git.metadataSource, "agent_external");
+    assert.equal(scanned.git.hasCommits, true);
+    assert.equal(scanned.git.branch, "main");
+    assert.equal(scanned.git.lastCommitMessage, "Agent-authored commit");
+    assert.equal(scanned.github.state, "linked");
+    assert.equal(scanned.github.repository?.nameWithOwner, "example/agent-project");
+
+    await assert.rejects(
+      () => initializeProject("agent-project"),
+      (error: unknown) => error instanceof ProjectActionError && error.code === "agent_external_git",
+    );
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    if (oldExternalRoots === undefined) delete process.env.GIT_SCAN_EXTERNAL_GIT_ROOTS; else process.env.GIT_SCAN_EXTERNAL_GIT_ROOTS = oldExternalRoots;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(searchRoot, { recursive: true, force: true })]);
+  }
+});
+
+test("keeps a last known size when a refresh measurement fails", () => {
+  const known = { status: "complete" as const, bytes: 42_000 };
+  const failed = { status: "error" as const, code: "measurement_failed" as const, message: "Size unavailable because part of this folder could not be read." as const };
+  assert.equal(preserveKnownProjectSize(known, failed), known);
+  assert.equal(preserveKnownProjectSize(failed, known), known);
 });
 
 test("sync comparison classifies local and remote refs reproducibly", async () => {
