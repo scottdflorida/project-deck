@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, pullProject, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, findLatestProjectFileAt, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, pullProject, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -290,6 +290,37 @@ test("measures nested and hidden regular files while assigning symlinks zero byt
     await symlink(outside, path.join(root, "outside-link"));
     await symlink(root, path.join(root, "loop"));
     assert.deepEqual(await measureProjectSize(root), { status: "complete", bytes: 26 });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("finds the newest project file while excluding Git metadata, dependencies, and symlinks", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "project-activity-test-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "project-activity-outside-"));
+  try {
+    await mkdir(path.join(root, ".git", "objects"), { recursive: true });
+    await mkdir(path.join(root, "node_modules", "package"), { recursive: true });
+    await mkdir(path.join(root, "src"), { recursive: true });
+    const older = path.join(root, "README.md");
+    const newestProjectFile = path.join(root, "src", "index.ts");
+    const newestGitFile = path.join(root, ".git", "objects", "metadata");
+    const newestDependencyFile = path.join(root, "node_modules", "package", "index.js");
+    const outsideFile = path.join(outside, "future.txt");
+    await writeFile(older, "older");
+    await writeFile(newestProjectFile, "newest project file");
+    await writeFile(newestGitFile, "newest but Git metadata");
+    await writeFile(newestDependencyFile, "newest but installed dependency");
+    await writeFile(outsideFile, "newest but outside the project");
+    await symlink(outsideFile, path.join(root, "outside-link"));
+    await utimes(older, new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-01T00:00:00.000Z"));
+    await utimes(newestProjectFile, new Date("2026-02-01T00:00:00.000Z"), new Date("2026-02-01T00:00:00.000Z"));
+    await utimes(newestGitFile, new Date("2026-03-01T00:00:00.000Z"), new Date("2026-03-01T00:00:00.000Z"));
+    await utimes(newestDependencyFile, new Date("2026-03-15T00:00:00.000Z"), new Date("2026-03-15T00:00:00.000Z"));
+    await utimes(outsideFile, new Date("2026-04-01T00:00:00.000Z"), new Date("2026-04-01T00:00:00.000Z"));
+
+    assert.equal(await findLatestProjectFileAt(root), "2026-02-01T00:00:00.000Z");
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });

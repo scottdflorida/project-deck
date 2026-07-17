@@ -14,13 +14,14 @@ actions in one place.
   iCloud-offloaded working trees are identified without hiding known Git facts
 - Git histories managed by coding agents in an external Git directory, resolved
   through Git's `core.worktree` metadata and labeled as agent-managed
-- Latest Git activity from the newest local commit or GitHub push, never the
-  folder modification time (copying or hydrating a folder does not look like work)
+- Latest activity from the newest local commit or GitHub push, falling back to
+  the newest regular project file only when no Git activity exists; Git,
+  dependency, cache, and build-output folders are excluded from that fallback
 - Exact-name GitHub matches and linked `origin` repositories
 - Ahead, behind, diverged, unpublished, and in-sync states
 - Clickable project, size, Git, GitHub, and sync column headers, with the same
   sorting controls in a compact selector on smaller screens
-- Working set, needs-attention, local-only, and ignored views
+- Working set, needs-attention, GitHub-sync-off, and hidden-project views
 - Search and a responsive project ledger
 
 If no useful local description is found, Project Deck says so rather than
@@ -31,12 +32,13 @@ files.
 **Copy folder path** copies that project's canonical absolute path. It is kept
 next to the visible path rather than presented as an unexplained project action.
 
-Projects marked **Ignored** are hidden from normal views but remain available in
-the Ignored view and can be restored. Projects without a GitHub repository can
+Projects marked **Hidden** are removed from normal views but remain available in
+the **Hidden projects** view and can be shown again. Use the **Visibility → Hide
+project** control on any row. Projects without a GitHub repository can
 be marked **Local only**, which keeps their local Git information visible while
 suppressing GitHub publishing prompts and remote-derived attention. Neither
 preference changes project files, Git remotes, or GitHub repositories. Every row
-exposes **Ignore project** in its identity section. A project without a repository
+exposes the Visibility control in its identity section. A project without a repository
 offers **Keep local only**; when a repository already exists, that control is
 instead labeled **Ignore GitHub sync** because the remote is not changed or made
 “local only.” **Resume GitHub sync** reverses that preference.
@@ -48,6 +50,11 @@ still exist, so the row offers **Commit & push N changes**. A clean branch that
 is behind GitHub offers **Pull N commits**. Pull is deliberately conservative:
 it fetches and performs a fast-forward-only update, and refuses to run when the
 working tree is dirty or the histories have diverged.
+
+When GitHub confirms that no repository exists, Sync explicitly shows **No
+GitHub repository** and **No sync check needed**. A same-name repository that
+exists but is not connected still shows **Not linked**, which is a different and
+actionable state.
 
 ## Available actions
 

@@ -18,6 +18,7 @@ const DEFAULT_ROOT = path.join(homedir(), "Documents");
 const COMMAND_TIMEOUT_MS = 1_500;
 const MAX_SUMMARY_LENGTH = 180;
 const GITHUB_CACHE_MS = 60_000;
+const ACTIVITY_IGNORED_NAMES = new Set([".git", "node_modules", ".next", "dist", "build", "coverage", ".venv", "venv", "target", ".cache", ".turbo"]);
 const SIZE_ERROR: ProjectSize = {
   status: "error",
   code: "measurement_failed",
@@ -94,6 +95,46 @@ export async function measureProjectSize(
     return { status: "complete", bytes };
   } catch {
     return { ...SIZE_ERROR };
+  }
+}
+
+/** Find the newest regular project file without following symlinks or treating
+ * Git metadata as user activity. A failed walk returns null, never a guessed
+ * folder timestamp. */
+export async function findLatestProjectFileAt(
+  projectPath: string,
+  io: SizeFs = { readdir, lstat },
+): Promise<string | null> {
+  let latest = 0;
+  const pending = [projectPath];
+  try {
+    while (pending.length) {
+      const directory = pending.pop()!;
+      let entries;
+      try {
+        entries = await io.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (ACTIVITY_IGNORED_NAMES.has(entry.name)) continue;
+        const entryPath = path.join(directory, entry.name);
+        let entryStat;
+        try {
+          entryStat = await io.lstat(entryPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
+        if (entryStat.isSymbolicLink()) continue;
+        if (entryStat.isDirectory()) pending.push(entryPath);
+        else if (entryStat.isFile() && Number.isFinite(entryStat.mtimeMs)) latest = Math.max(latest, entryStat.mtimeMs);
+      }
+    }
+    return latest > 0 ? new Date(latest).toISOString() : null;
+  } catch {
+    return null;
   }
 }
 
@@ -683,6 +724,44 @@ async function measureProjectSizeForScan(projectPath: string, root: string) {
     : { ...SIZE_ERROR };
 }
 
+async function findLatestProjectFileAtForScan(projectPath: string, root: string) {
+  if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0" || platform() === "win32") {
+    return findLatestProjectFileAt(projectPath);
+  }
+
+  const ignoredExpression = ["(", ...[...ACTIVITY_IGNORED_NAMES].flatMap((name, index) => [...(index ? ["-o"] : []), "-name", name]), ")", "-prune", "-o"];
+  const statArgs = platform() === "darwin" ? ["-f", "%m"] : ["-c", "%Y"];
+  const args = platform() === "darwin"
+    ? ["-x", projectPath, ...ignoredExpression, "-type", "f", "-exec", "stat", ...statArgs, "{}", "+"]
+    : [projectPath, "-xdev", ...ignoredExpression, "-type", "f", "-exec", "stat", ...statArgs, "{}", "+"];
+
+  return new Promise<string | null>((resolve) => {
+    const child = spawn("find", args, { cwd: root, stdio: ["ignore", "pipe", "ignore"] });
+    let buffer = "";
+    let latestSeconds = 0;
+    let timedOut = false;
+    const consume = (chunk: string, flush = false) => {
+      buffer += chunk;
+      const lines = buffer.split("\n");
+      if (!flush) buffer = lines.pop() || "";
+      else buffer = "";
+      for (const line of lines) {
+        const seconds = Number.parseInt(line.trim(), 10);
+        if (Number.isSafeInteger(seconds)) latestSeconds = Math.max(latestSeconds, seconds);
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => consume(chunk));
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, 5_000);
+    child.on("error", () => { clearTimeout(timer); resolve(null); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      consume("", true);
+      resolve(!timedOut && code === 0 && latestSeconds > 0 ? new Date(latestSeconds * 1_000).toISOString() : null);
+    });
+  });
+}
+
 async function measureProjectSizesForRoot(root: string, folderNames: string[]) {
   const sizes = new Map<string, ProjectSize>();
   if (root !== DEFAULT_ROOT || process.env.GIT_SCAN_USE_NATIVE_SIZE === "0") {
@@ -1135,7 +1214,7 @@ async function scanProject(
   name: string,
   github: GithubContext,
   refreshRemote: boolean,
-  options: { skipSize?: boolean; size?: ProjectSize; description?: ProjectDescription; externalGitDirs?: Map<string, string> } = {},
+  options: { skipSize?: boolean; skipFileActivity?: boolean; size?: ProjectSize; description?: ProjectDescription; externalGitDirs?: Map<string, string> } = {},
 ): Promise<ProjectRecord> {
   const projectPath = path.join(root, name);
   const canonicalPath = await canonicalizeProjectPath(projectPath);
@@ -1153,6 +1232,9 @@ async function scanProject(
 
   if (!isRepository) {
     const matchedRepository = github.byName.get(name.toLowerCase()) || null;
+    const latestFileAt = !matchedRepository?.pushedAt && !options.skipFileActivity
+      ? await findLatestProjectFileAtForScan(projectPath, root)
+      : null;
     return {
       name,
       canonicalPath,
@@ -1161,6 +1243,7 @@ async function scanProject(
       summary: description.compact,
       preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies,
+      latestFileAt,
       modifiedAt: projectStat.mtime.toISOString(),
       size,
       git: {
@@ -1229,6 +1312,10 @@ async function scanProject(
     refreshRemote,
     gitMetadata,
   );
+  const repository = linkedRepository || matched;
+  const latestFileAt = !lastCommitParts[0] && !repository?.pushedAt && !options.skipFileActivity
+    ? await findLatestProjectFileAtForScan(projectPath, root)
+    : null;
 
   return {
     name,
@@ -1238,6 +1325,7 @@ async function scanProject(
     summary: description.compact,
     preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
     technologies,
+    latestFileAt,
     modifiedAt: projectStat.mtime.toISOString(),
     size,
     git: {
@@ -1253,7 +1341,7 @@ async function scanProject(
     },
     github: {
       state: remote ? "linked" : matched ? "matched" : github.available ? "none" : "unavailable",
-      repository: linkedRepository || matched,
+      repository,
     },
     sync,
   };
@@ -1340,12 +1428,14 @@ export async function scanProjectsProgressively(
   const projects: ProjectRecord[] = folderNames.map((name): ProjectRecord => {
     const existing = previousByName.get(name);
     if (existing) {
+      const activityPending = !existing.git.lastCommitAt && !existing.github.repository?.pushedAt;
       return {
         ...existing,
         transient: {
           git: "checking" as const,
           github: "checking" as const,
           sync: "checking" as const,
+          ...(activityPending ? { activity: "checking" as const } : {}),
           ...(existing.size.status === "complete" ? {} : { size: "checking" as const }),
         },
       };
@@ -1360,12 +1450,13 @@ export async function scanProjectsProgressively(
       summary: "",
       preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies: [],
+      latestFileAt: null,
       modifiedAt: new Date().toISOString(),
       size: { ...SIZE_ERROR },
       git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, metadataSource: "folder", lastCommitAt: null, lastCommitMessage: null },
       github: { state: "unavailable", repository: null },
       sync: { state: "unavailable", ahead: 0, behind: 0, checkedRemote: false, detail: "Git and GitHub status are still being checked in the background." },
-      transient: { size: "checking", git: "checking", github: "checking", sync: "checking" },
+      transient: { size: "checking", git: "checking", github: "checking", sync: "checking", activity: "checking" },
     };
   });
 
@@ -1384,6 +1475,11 @@ export async function scanProjectsProgressively(
   publish(true);
 
   const indexed = folderNames.map((name, index) => ({ name, index }));
+  const factReady = indexed.map(() => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    return { promise, resolve };
+  });
   const applyGithub = (project: ProjectRecord) => {
     const linkedName = project.github.state === "linked"
       ? project.github.repository?.nameWithOwner.toLowerCase()
@@ -1409,24 +1505,29 @@ export async function scanProjectsProgressively(
     const current = projects[index];
     const resolved = await scanProject(root, name, github, refreshRemote, {
       skipSize: true,
+      skipFileActivity: true,
       size: current.size,
       description: current.description,
       externalGitDirs,
     });
     const sizePending = projects[index].transient?.size === "checking";
+    const activityPending = projects[index].transient?.activity === "checking";
     const nextTransient: ProjectRecord["transient"] = {
       ...(sizePending ? { size: "checking" as const } : {}),
+      ...(activityPending ? { activity: "checking" as const } : {}),
       ...(!githubSettled ? { github: "checking" as const } : {}),
     };
     const next: ProjectRecord = {
       ...resolved,
       size: projects[index].size,
+      latestFileAt: resolved.latestFileAt ?? projects[index].latestFileAt ?? null,
       description: projects[index].description,
       summary: projects[index].description.compact,
       transient: Object.keys(nextTransient).length ? nextTransient : undefined,
     };
     projects[index] = github.available ? applyGithub(next) : next;
     publish(true);
+    factReady[index].resolve();
   });
 
   const githubWork = (async () => {
@@ -1475,7 +1576,25 @@ export async function scanProjectsProgressively(
     publish(true);
   });
 
-  await Promise.all([factsWork, githubWork, descriptionWork, sizeWork]);
+  const activityWork = mapWithConcurrency(indexed, 8, async ({ name, index }) => {
+    await factReady[index].promise;
+    const facts = projects[index];
+    const hasGitActivity = Boolean(facts.git.lastCommitAt || facts.github.repository?.pushedAt);
+    const latestFileAt = hasGitActivity
+      ? facts.latestFileAt ?? null
+      : await findLatestProjectFileAtForScan(path.join(root, name), root);
+    const current = projects[index];
+    const transient = { ...current.transient };
+    delete transient.activity;
+    projects[index] = {
+      ...current,
+      latestFileAt,
+      transient: Object.keys(transient).length ? transient : undefined,
+    };
+    publish(true);
+  });
+
+  await Promise.all([factsWork, githubWork, descriptionWork, sizeWork, activityWork]);
   for (let index = 0; index < projects.length; index += 1) {
     projects[index] = { ...projects[index], transient: undefined };
   }
@@ -1517,6 +1636,7 @@ export async function scanProjectsQuick(
         summary: "",
         preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
         technologies: [],
+        latestFileAt: null,
         modifiedAt: now,
         size: { ...SIZE_ERROR },
         git: {
@@ -1536,7 +1656,7 @@ export async function scanProjectsQuick(
           checkedRemote: false,
           detail: "Git and GitHub status are still being checked in the background.",
         },
-        transient: { size: "checking", git: "checking", github: "checking", sync: "checking" },
+        transient: { size: "checking", git: "checking", github: "checking", sync: "checking", activity: "checking" },
       });}),
     };
   }
@@ -1577,6 +1697,7 @@ export async function scanProjectsQuick(
       summary: "",
       preferences: { ignored: projectPreference.ignored, localOnly: projectPreference.localOnly },
       technologies: [],
+      latestFileAt: null,
       modifiedAt,
       size: { ...SIZE_ERROR },
       git: {
@@ -1591,7 +1712,7 @@ export async function scanProjectsQuick(
       },
       github: { state: linkedRepository ? "linked" as const : "unavailable" as const, repository: linkedRepository },
       sync: { state: linkedRepository ? "unavailable" as const : "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: linkedRepository ? "The GitHub remote is linked; detailed sync status is still being checked." : "No GitHub remote is linked." },
-      transient: { size: "checking" as const, ...(gitMetadata.isRepository ? { git: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
+      transient: { size: "checking" as const, activity: "checking" as const, ...(gitMetadata.isRepository ? { git: "checking" as const } : {}), ...(linkedRepository ? { sync: "checking" as const } : {}) },
     } satisfies ProjectRecord;
   });
   onFacts?.({ rootPath: root, rootLabel: rootLabel(root), scannedAt: fastNow, enriching: true, github: { available: false, login: null }, projects: fastProjects });
@@ -1619,6 +1740,7 @@ export async function scanProjectsQuick(
       },
       transient: {
         size: "checking" as const,
+        activity: "checking" as const,
         ...(project.git.isRepository ? { git: "checking" as const } : {}),
         ...(knownLinked ? { sync: "checking" as const } : {}),
       },
@@ -1685,8 +1807,8 @@ export async function scanProjectsQuick(
       ...project,
       size: projectSizes.get(project.name) || { ...SIZE_ERROR },
       transient: project.git.isRepository
-        ? { git: "checking" as const, ...(project.github.state === "linked" ? { sync: "checking" as const } : {}) }
-        : undefined,
+        ? { git: "checking" as const, activity: "checking" as const, ...(project.github.state === "linked" ? { sync: "checking" as const } : {}) }
+        : { activity: "checking" as const },
     })),
   };
 }
@@ -1732,9 +1854,9 @@ export async function setProjectPreferences(
   await persistSettings();
   return {
     message: patch.ignored === true
-      ? `${name} moved to Ignored.`
+      ? `${name} moved to Hidden projects.`
       : patch.ignored === false
-        ? `${name} restored to the working set.`
+        ? `${name} is visible in the working set again.`
         : patch.localOnly === true
           ? `${name} will ignore GitHub publishing and sync alerts.`
           : patch.localOnly === false

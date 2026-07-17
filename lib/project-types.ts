@@ -54,6 +54,9 @@ export interface ProjectRecord {
   summary: string;
   preferences: ProjectPreferences;
   technologies: string[];
+  /** Newest regular project-file timestamp, excluding Git metadata. Used only
+   * when neither a local commit nor a GitHub push provides activity. */
+  latestFileAt?: string | null;
   modifiedAt: string;
   size: ProjectSize;
   git: {
@@ -84,7 +87,7 @@ export interface ProjectRecord {
   };
   /** Facts still being refreshed. A usable value in the matching field is the
    * last successful value; an unavailable placeholder is pending, not failed. */
-  transient?: Partial<Record<"size" | "git" | "github" | "sync", "checking">>;
+  transient?: Partial<Record<"size" | "git" | "github" | "sync" | "activity", "checking">>;
 }
 
 export interface ProjectScanResponse {

@@ -7,7 +7,7 @@ export type PresentationTone = "good" | "warn" | "bad" | "neutral" | "checking" 
 export type PresentationResolution = "known" | "pending" | "not_checked";
 export type GitPresentationKey = "not_initialized" | "no_commits" | "changes" | "clean" | "offloaded" | "not_checked" | "checking";
 export type GithubPresentationKey = "none" | "match_found" | "linked" | "sign_in" | "checking";
-export type SyncPresentationKey = "not_linked" | "history_mismatch" | "no_commits" | "not_pushed" | "ahead" | "behind" | "diverged" | "in_sync" | "not_checked" | "checking";
+export type SyncPresentationKey = "no_repository" | "not_linked" | "history_mismatch" | "no_commits" | "not_pushed" | "ahead" | "behind" | "diverged" | "in_sync" | "not_checked" | "checking";
 
 export type StatePresentation<Key extends string> = {
   key: Key;
@@ -22,7 +22,7 @@ export type StatePresentation<Key extends string> = {
 
 export const gitRanks: readonly GitPresentationKey[] = ["not_initialized", "no_commits", "changes", "clean"];
 export const githubRanks: readonly GithubPresentationKey[] = ["none", "match_found", "linked"];
-export const syncRanks: readonly SyncPresentationKey[] = ["not_linked", "history_mismatch", "no_commits", "not_pushed", "ahead", "behind", "diverged", "in_sync"];
+export const syncRanks: readonly SyncPresentationKey[] = ["no_repository", "not_linked", "history_mismatch", "no_commits", "not_pushed", "ahead", "behind", "diverged", "in_sync"];
 
 type SortProjection = { bucket: 0 | 1 | 2; rank: number; count: number };
 
@@ -45,16 +45,21 @@ export function hasDisconnectedHistory(project: ProjectRecord) {
 
 export type ProjectActivity = {
   at: string | null;
-  source: "local_commit" | "github_push" | "none";
+  source: "local_commit" | "github_push" | "file_update" | "none";
   message: string | null;
 };
 
-/** Latest Git activity deliberately excludes filesystem mtimes: moving or
- * hydrating a folder is not project work. */
+/** Git activity wins. The newest project-file timestamp is a deliberate
+ * fallback only when neither local nor GitHub history exists. */
 export function projectActivity(project: ProjectRecord): ProjectActivity {
   const localTime = validTimestamp(project.git.lastCommitAt);
   const githubTime = validTimestamp(project.github.repository?.pushedAt);
-  if (localTime === null && githubTime === null) return { at: null, source: "none", message: null };
+  if (localTime === null && githubTime === null) {
+    const fileTime = validTimestamp(project.latestFileAt);
+    return fileTime === null
+      ? { at: null, source: "none", message: null }
+      : { at: project.latestFileAt || null, source: "file_update", message: null };
+  }
   if (githubTime !== null && (localTime === null || githubTime > localTime)) {
     return { at: project.github.repository?.pushedAt || null, source: "github_push", message: null };
   }
@@ -120,6 +125,8 @@ export function syncPresentation(project: ProjectRecord): StatePresentation<Sync
   if (state === "no_commits") return { key: "no_commits", label: "No commits", detail: project.sync.detail, tone: "neutral", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: 0 };
   if (state === "no_remote") {
     const repository = project.github.state === "matched" ? project.github.repository?.nameWithOwner : null;
+    if (project.github.state === "none") return { key: "no_repository", label: "No GitHub repository", detail: "There is no GitHub repository to compare, so sync does not apply.", tone: "quiet", resolution: "known", actionable: false, refreshing, count: 0 };
+    if (project.github.state === "unavailable") return { key: "not_checked", label: "GitHub not checked", detail: "Connect GitHub to determine whether this project has a repository to sync.", tone: "quiet", resolution: "not_checked", actionable: false, refreshing, count: 0 };
     return { key: "not_linked", label: "Not linked", detail: repository ? `${repository} was found. Link it to compare this project.` : "No local GitHub origin is configured.", tone: project.github.state === "matched" ? "warn" : "neutral", resolution: "known", actionable: project.github.state === "matched" && !project.preferences.localOnly, refreshing, count: 0 };
   }
   if (refreshing) return { key: "checking", label: "Checking…", detail: "Comparing local and GitHub refs", tone: "checking", resolution: "pending", actionable: false, refreshing: false, count: 0 };

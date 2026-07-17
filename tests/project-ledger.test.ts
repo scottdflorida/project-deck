@@ -153,11 +153,31 @@ test("latest activity uses Git history and never treats folder copying as projec
   assert.deepEqual(projectActivity(remoteNewer), { at: "2026-07-11T12:00:00.000Z", source: "github_push", message: null });
 
   const copiedOnly = project("copied-only", {
+    latestFileAt: "2026-05-12T08:30:00.000Z",
     modifiedAt: "2026-07-17T18:00:00.000Z",
     git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
     github: { state: "none", repository: null },
   });
-  assert.deepEqual(projectActivity(copiedOnly), { at: null, source: "none", message: null });
+  assert.deepEqual(projectActivity(copiedOnly), { at: "2026-05-12T08:30:00.000Z", source: "file_update", message: null });
+
+  const noKnownActivity = project("empty-folder", {
+    git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "none", repository: null },
+    latestFileAt: null,
+  });
+  assert.deepEqual(projectActivity(noKnownActivity), { at: null, source: "none", message: null });
+});
+
+test("sync explicitly states when no GitHub repository exists", () => {
+  const withoutGithub = project("local-folder", {
+    github: { state: "none", repository: null },
+    sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." },
+  });
+  const presentation = syncPresentation(withoutGithub);
+  assert.equal(presentation.key, "no_repository");
+  assert.equal(presentation.label, "No GitHub repository");
+  assert.match(presentation.detail, /sync does not apply/);
+  assert.equal(presentation.actionable, false);
 });
 
 test("a pushed same-name repository cannot masquerade as a safely linkable empty history", () => {
