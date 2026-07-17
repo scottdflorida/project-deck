@@ -12,6 +12,8 @@ actions in one place.
 - Total on-disk size for every project
 - Git status, current branch, recent activity, and working-tree changes; slow or
   iCloud-offloaded working trees are identified without hiding known Git facts
+- Latest Git activity from the newest local commit or GitHub push, never the
+  folder modification time (copying or hydrating a folder does not look like work)
 - Exact-name GitHub matches and linked `origin` repositories
 - Ahead, behind, diverged, unpublished, and in-sync states
 - Clickable project, size, Git, GitHub, and sync column headers, with the same
@@ -95,6 +97,12 @@ routing filesystem requests through the web preview. If that service stops or
 cannot answer, the initial placeholders are replaced within five seconds by a
 clear recovery message. Restart `npm run dev`, then choose **Retry now**; the
 failed check does not change any project files or settings.
+
+Every repository row includes **Status evidence** showing the local Git result,
+the configured `origin`, the GitHub repository and latest push, and the basis of
+the sync comparison. If GitHub has pushed history but the selected folder has no
+local commits, Project Deck reports **Histories disconnected** and suppresses
+the normal push action instead of assuming an exact-name match is safe.
 
 When GitHub is disconnected, the header shows **Connect GitHub** rather than an
 ambiguous status. The in-app device flow repairs expired credentials and unlocks

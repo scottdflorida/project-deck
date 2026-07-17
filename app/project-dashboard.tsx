@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFailureResponse, ActionResponse, ProjectRecord, ProjectScanResponse, RootSelectionResponse } from "@/lib/project-types";
-import { attentionReason, compareProjects, gitPresentation, githubPresentation, needsAttention, projectActionKey, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
+import { attentionReason, compareProjects, gitPresentation, githubPresentation, hasDisconnectedHistory, needsAttention, projectActionKey, projectActivity, projectInView, projectSearchText, syncPresentation, type ProjectView, type SortDirection, type SortKey } from "@/lib/project-ledger";
 import { formatProjectSize } from "@/lib/format-project-size";
 import { AlertCircle, ArrowDown, ArrowUp, Check, Copy, ExternalLink, Folder, GitBranch, Github, LoaderCircle, Lock, MoreHorizontal, Pencil, RefreshCw, Search, Unlock, X } from "@/app/icons";
 
@@ -42,14 +42,20 @@ function refreshingDetail(detail: string, refreshing: boolean) {
   return refreshing ? `${detail} · Refreshing…` : detail;
 }
 
-function latestUpdate(project: ProjectRecord) {
-  const value = project.git.lastCommitAt || project.modifiedAt;
-  if (!value) return { relative: "Unavailable", exact: "Latest update unavailable" };
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return { relative: "Unavailable", exact: "Latest update unavailable" };
+function latestGitActivity(project: ProjectRecord) {
+  const activity = projectActivity(project);
+  if (!activity.at) return { at: null, relative: "No Git activity", exact: "No local commit or GitHub push was found.", source: "No commit or push found" };
+  const date = new Date(activity.at);
+  if (Number.isNaN(date.getTime())) return { at: null, relative: "Unavailable", exact: "Git activity timestamp unavailable", source: "Timestamp unavailable" };
   const days = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86_400_000));
   const relative = days === 0 ? "today" : days === 1 ? "yesterday" : days < 30 ? `${days} days ago` : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
-  return { relative, exact: date.toLocaleString() };
+  return { at: activity.at, relative, exact: date.toLocaleString(), source: activity.source === "local_commit" ? "Local commit" : project.github.state === "matched" ? "GitHub push · repository not linked locally" : "GitHub push" };
+}
+
+function exactTimestamp(value: string | null | undefined) {
+  if (!value) return "Not reported";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Not reported" : date.toLocaleString();
 }
 
 function useDialogFocus(ref: React.RefObject<HTMLElement | null>, busy: boolean, onClose: () => void) {
@@ -142,6 +148,7 @@ function ProjectActions({ project, githubAvailable, busy, onAction, onModal }: {
   if (actionKey === "create") return <button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "create", project, trigger: event.currentTarget })}><Github size={15}/> Create GitHub repository</button>;
   if (actionKey === "checking_sync") return <span className="action-guidance"><LoaderCircle className="spin" size={14}/> Checking sync…</span>;
   if (actionKey === "reconcile") return <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
+  if (actionKey === "review_history") return <span className="action-guidance danger"><AlertCircle size={14}/> Local and GitHub histories are disconnected — review the evidence below</span>;
   if (actionKey === "working_tree_not_checked") return <span className="action-guidance">Working tree not checked — make files available, then refresh</span>;
   if (actionKey === "comparison_not_checked") return <span className="action-guidance">Comparison not checked — refresh to try again</span>;
   if (actionKey === "push") {
@@ -153,9 +160,25 @@ function ProjectActions({ project, githubAvailable, busy, onAction, onModal }: {
   return <span className="action-guidance">No repository action available</span>;
 }
 
+function StatusEvidence({ project }: { project: ProjectRecord }) {
+  const git = gitPresentation(project);
+  const github = githubPresentation(project);
+  const sync = syncPresentation(project);
+  const repository = project.github.repository;
+  return <details className="status-evidence" open={hasDisconnectedHistory(project) || undefined}>
+    <summary>Status evidence</summary>
+    <dl>
+      <div><dt>Local Git</dt><dd>{git.label}. {git.detail}</dd></div>
+      <div><dt>Origin</dt><dd>{project.github.state === "linked" ? repository?.nameWithOwner || "GitHub origin configured" : "No origin remote is configured in this folder"}</dd></div>
+      <div><dt>GitHub</dt><dd>{repository ? `${repository.nameWithOwner} · latest push ${exactTimestamp(repository.pushedAt)}` : github.detail}</dd></div>
+      <div><dt>Comparison</dt><dd>{sync.detail}</dd></div>
+    </dl>
+  </details>;
+}
+
 function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onCopy, onModal, onDismissActionError }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; actionError: ProjectActionFailure | null; onAction: (project: ProjectRecord, kind: "init", trigger: HTMLElement) => void; onCopy: (project: ProjectRecord) => void; onModal: (modal: NonNullable<ModalState>) => void; onDismissActionError: () => void }) {
-  const git = gitPresentation(project); const github = githubPresentation(project); const sync = syncPresentation(project); const update = latestUpdate(project);
-  const SyncIcon = sync.key === "checking" ? LoaderCircle : sync.key === "in_sync" ? Check : sync.key === "ahead" || sync.key === "not_pushed" ? ArrowUp : sync.key === "behind" ? ArrowDown : sync.key === "diverged" ? AlertCircle : Github;
+  const git = gitPresentation(project); const github = githubPresentation(project); const sync = syncPresentation(project); const update = latestGitActivity(project);
+  const SyncIcon = sync.key === "checking" ? LoaderCircle : sync.key === "in_sync" ? Check : sync.key === "ahead" || sync.key === "not_pushed" ? ArrowUp : sync.key === "behind" ? ArrowDown : sync.key === "diverged" || sync.key === "history_mismatch" ? AlertCircle : Github;
   const descriptionMissing = project.description.source === "none";
   return <li className="project-row" data-project={project.name} data-project-path={project.canonicalPath}>
     <article className="project-record" aria-labelledby={`project-${encodeURIComponent(project.canonicalPath)}`}>
@@ -164,13 +187,13 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
         <div className={`description ${descriptionMissing ? "missing" : ""}`}>{project.description.source === "checking" ? <p>Checking local description…</p> : descriptionMissing ? <><p>No suitable local description found</p><button onClick={(event) => onModal({ type: "description", project, trigger: event.currentTarget })}>Add local description</button></> : <><p aria-label={project.description.text}>{project.description.compact}</p><span>{project.description.sourceLabel}</span></>}</div>
         <div className="path-line"><span>Folder path</span><code>{project.canonicalPath}</code><button onClick={() => onCopy(project)} aria-label={`Copy absolute folder path for ${project.name}`}><Copy size={13}/> Copy folder path</button></div>
       </div>
-      <div className="project-facts"><div><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong></div><div><span>Latest update:</span><time dateTime={project.git.lastCommitAt || project.modifiedAt || undefined} title={update.exact} aria-label={`Latest update: ${update.relative}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time></div>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
+      <div className="project-facts"><div><span>Total size</span><strong>{project.transient?.size === "checking" ? "Measuring…" : project.size.status === "complete" ? formatProjectSize(project.size.bytes) : "Unavailable"}</strong></div><div><span>Latest Git activity:</span><time dateTime={update.at || undefined} title={update.exact} aria-label={`Latest Git activity: ${update.relative}. ${update.source}. Exact time: ${update.exact}`}>{update.relative}<span className="sr-only"> · {update.exact}</span></time><small className="activity-source">{update.source}</small></div>{project.technologies.length > 0 && <div className="technology-list" aria-label="Technologies">{project.technologies.join(" · ")}</div>}{needsAttention(project) && <p className="attention-reason">{attentionReason(project)}</p>}</div>
       <div className="repository-rail" aria-label={`Repository state for ${project.name}`}>
         <div className={`rail-stop ${git.tone}`} data-state-key={git.key}><span><GitBranch size={14}/> Git</span><strong>{git.label}</strong><small>{refreshingDetail(git.detail, git.refreshing)}</small></div>
         <div className={`rail-stop ${github.tone}`} data-state-key={github.key}><span><Github size={14}/> GitHub</span><strong>{github.label}</strong><small>{refreshingDetail(github.detail, github.refreshing)}</small></div>
         <div className={`rail-stop ${sync.tone}`} data-state-key={sync.key}><span><SyncIcon className={sync.key === "checking" ? "spin" : undefined} size={14}/> Sync</span><strong>{sync.label}</strong><small>{refreshingDetail(sync.detail, sync.refreshing)}</small></div>
       </div>
-      <div className="record-actions" aria-label={`Actions for ${project.name}`}>{actionError?.projectPath === project.canonicalPath && <div className="project-action-error" role="alert"><strong>{actionError.label} failed for {project.name}</strong><p>{actionError.message}</p><button onClick={onDismissActionError}>Dismiss</button></div>}<div className="primary-action"><ProjectActions project={project} githubAvailable={githubAvailable} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)} onModal={onModal}/></div><div className="record-utilities">{project.github.state === "linked" && project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={13}/></a>}<details><summary>Sync details</summary><p>{project.sync.detail}</p></details></div></div>
+      <div className="record-actions" aria-label={`Actions for ${project.name}`}>{actionError?.projectPath === project.canonicalPath && <div className="project-action-error" role="alert"><strong>{actionError.label} failed for {project.name}</strong><p>{actionError.message}</p><button onClick={onDismissActionError}>Dismiss</button></div>}<div className="primary-action"><ProjectActions project={project} githubAvailable={githubAvailable} busy={busy} onAction={(kind, trigger) => onAction(project, kind, trigger)} onModal={onModal}/></div><div className="record-utilities">{project.github.repository && <a href={project.github.repository.url} target="_blank" rel="noreferrer">Open GitHub repository <ExternalLink size={13}/></a>}<StatusEvidence project={project}/></div></div>
     </article>
   </li>;
 }

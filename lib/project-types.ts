@@ -15,6 +15,9 @@ export interface GithubRepository {
   nameWithOwner: string;
   url: string;
   isPrivate: boolean | null;
+  /** Most recent Git push reported by GitHub. This remains useful when the
+   * selected local folder has missing or disconnected Git metadata. */
+  pushedAt?: string | null;
 }
 
 export type ProjectSize =

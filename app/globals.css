@@ -144,6 +144,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .project-facts span, .project-facts .technology-list { color: var(--faint); font: 9px var(--font-geist-mono), monospace; letter-spacing: .04em; text-transform: uppercase; }
 .project-facts strong { font: 500 18px/1 var(--font-geist-mono), monospace; letter-spacing: -.045em; }
 .project-facts time { color: var(--ink-2); font-size: 10px; }
+.project-facts .activity-source { color: var(--muted); font-size: 9px; line-height: 1.35; }
 .project-facts .technology-list { line-height: 1.45; }
 .attention-reason { margin: 0; color: var(--warn); font-size: 10px; line-height: 1.35; }
 
@@ -181,10 +182,15 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .action-guidance { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .action-guidance.good { color: var(--good); }
 .action-guidance.caution { color: var(--warn); }
+.action-guidance.danger { color: var(--bad); }
 .record-utilities { display: grid; gap: 7px; color: var(--muted); font-size: 10px; }
 .record-utilities a { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-dark); text-decoration: none; }
 .record-utilities summary { width: max-content; text-decoration: underline; text-underline-offset: 3px; }
-.record-utilities p { margin: 6px 0 0; line-height: 1.4; }
+.status-evidence[open] { width: min(100%, 230px); }
+.status-evidence dl { display: grid; gap: 8px; margin: 8px 0 0; padding: 9px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.status-evidence dl > div { display: grid; gap: 2px; }
+.status-evidence dt { color: var(--faint); font: 8px var(--font-geist-mono), monospace; letter-spacing: .06em; text-transform: uppercase; }
+.status-evidence dd { margin: 0; color: var(--ink-2); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
 
 .skeleton { min-height: 144px; display: grid; grid-template-columns: minmax(330px, 1.8fr) minmax(120px, .55fr) minmax(135px, .7fr) minmax(150px, .8fr) minmax(150px, .8fr) minmax(180px, .85fr); gap: 14px; align-items: center; padding: 18px 12px; }
 .sk { height: 22px; border-radius: 3px; background: #e3e2dd; animation: pulse 1.5s ease-in-out infinite; }

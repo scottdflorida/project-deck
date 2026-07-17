@@ -880,7 +880,7 @@ async function loadGithubContext(root: string): Promise<GithubContext> {
       "--limit",
       "1000",
       "--json",
-      "name,nameWithOwner,url,isPrivate",
+      "name,nameWithOwner,url,isPrivate,pushedAt",
     ],
     root,
     8_000,

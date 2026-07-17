@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ProjectRecord } from "../lib/project-types";
-import { attentionReason, compareProjects, gitPresentation, githubPresentation, needsAttention, projectActionKey, projectInView, projectSearchText, syncPresentation } from "../lib/project-ledger";
+import { attentionReason, compareProjects, gitPresentation, githubPresentation, hasDisconnectedHistory, needsAttention, projectActionKey, projectActivity, projectInView, projectSearchText, syncPresentation } from "../lib/project-ledger";
 
 function project(name: string, patch: Partial<ProjectRecord> = {}): ProjectRecord {
   return {
@@ -117,7 +117,7 @@ test("canonical presentations freeze user-visible state language and precedence"
   const states = [
     [project("pending", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null }, transient: { git: "checking" } }), "Checking…"],
     [project("folder", { git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }), "Not initialized"],
-    [project("empty", { git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null } }), "No commits"],
+    [project("empty", { git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 0, statusAvailable: false, statusReason: "timeout", lastCommitAt: null, lastCommitMessage: null } }), "No local commits"],
     [project("changed", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null } }), "2 local changes"],
     [project("clean"), "Clean"],
     [project("cloud", { git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: false, statusReason: "offloaded", lastCommitAt: null, lastCommitMessage: null } }), "Files offloaded"],
@@ -135,6 +135,53 @@ test("canonical presentations freeze user-visible state language and precedence"
   assert.equal(projectActionKey(matched, true), "link");
   assert.match(projectSearchText(matched), /repository found/);
   assert.doesNotMatch(projectSearchText(matched), /no remote/);
+});
+
+test("latest activity uses Git history and never treats folder copying as project work", () => {
+  const localCommit = project("local-newer", {
+    modifiedAt: "2026-07-17T18:00:00.000Z",
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: true, lastCommitAt: "2026-07-10T12:00:00.000Z", lastCommitMessage: "Local work" },
+    github: { state: "linked", repository: { name: "local-newer", nameWithOwner: "person/local-newer", url: "https://github.com/person/local-newer", isPrivate: true, pushedAt: "2026-07-09T12:00:00.000Z" } },
+  });
+  assert.deepEqual(projectActivity(localCommit), { at: "2026-07-10T12:00:00.000Z", source: "local_commit", message: "Local work" });
+
+  const remoteNewer = project("remote-newer", {
+    modifiedAt: "2026-07-01T18:00:00.000Z",
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 0, statusAvailable: true, lastCommitAt: "2026-07-09T12:00:00.000Z", lastCommitMessage: "Older local work" },
+    github: { state: "linked", repository: { name: "remote-newer", nameWithOwner: "person/remote-newer", url: "https://github.com/person/remote-newer", isPrivate: true, pushedAt: "2026-07-11T12:00:00.000Z" } },
+  });
+  assert.deepEqual(projectActivity(remoteNewer), { at: "2026-07-11T12:00:00.000Z", source: "github_push", message: null });
+
+  const copiedOnly = project("copied-only", {
+    modifiedAt: "2026-07-17T18:00:00.000Z",
+    git: { isRepository: false, branch: null, hasCommits: false, changeCount: 0, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "none", repository: null },
+  });
+  assert.deepEqual(projectActivity(copiedOnly), { at: null, source: "none", message: null });
+});
+
+test("a pushed same-name repository cannot masquerade as a safely linkable empty history", () => {
+  const mismatch = project("lifting", {
+    git: { isRepository: true, branch: "main", hasCommits: false, changeCount: 30, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    github: { state: "matched", repository: { name: "lifting", nameWithOwner: "person/lifting", url: "https://github.com/person/lifting", isPrivate: true, pushedAt: "2026-07-17T18:29:31.000Z" } },
+    sync: { state: "no_remote", ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." },
+  });
+  assert.equal(hasDisconnectedHistory(mismatch), true);
+  assert.equal(gitPresentation(mismatch).label, "No local commits");
+  assert.equal(syncPresentation(mismatch).key, "history_mismatch");
+  assert.equal(syncPresentation(mismatch).label, "Histories disconnected");
+  assert.equal(projectActionKey(mismatch, true), "review_history");
+  assert.match(attentionReason(mismatch), /local Git history is empty/);
+  assert.equal(projectActivity(mismatch).source, "github_push");
+
+  const linkedButEmpty = {
+    ...mismatch,
+    github: { ...mismatch.github, state: "linked" as const },
+    sync: { state: "no_commits" as const, ahead: 0, behind: 0, checkedRemote: false, detail: "There are no local commits yet." },
+  };
+  assert.equal(hasDisconnectedHistory(linkedButEmpty), true);
+  assert.equal(syncPresentation(linkedButEmpty).key, "history_mismatch");
+  assert.equal(projectActionKey(linkedButEmpty, true), "review_history");
 });
 
 test("action guidance never calls an unchecked working tree up to date", () => {

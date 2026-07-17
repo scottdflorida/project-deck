@@ -7,7 +7,7 @@ export type PresentationTone = "good" | "warn" | "bad" | "neutral" | "checking" 
 export type PresentationResolution = "known" | "pending" | "not_checked";
 export type GitPresentationKey = "not_initialized" | "no_commits" | "changes" | "clean" | "offloaded" | "not_checked" | "checking";
 export type GithubPresentationKey = "none" | "match_found" | "linked" | "sign_in" | "checking";
-export type SyncPresentationKey = "not_linked" | "no_commits" | "not_pushed" | "ahead" | "behind" | "diverged" | "in_sync" | "not_checked" | "checking";
+export type SyncPresentationKey = "not_linked" | "history_mismatch" | "no_commits" | "not_pushed" | "ahead" | "behind" | "diverged" | "in_sync" | "not_checked" | "checking";
 
 export type StatePresentation<Key extends string> = {
   key: Key;
@@ -22,12 +22,42 @@ export type StatePresentation<Key extends string> = {
 
 export const gitRanks: readonly GitPresentationKey[] = ["not_initialized", "no_commits", "changes", "clean"];
 export const githubRanks: readonly GithubPresentationKey[] = ["none", "match_found", "linked"];
-export const syncRanks: readonly SyncPresentationKey[] = ["not_linked", "no_commits", "not_pushed", "ahead", "behind", "diverged", "in_sync"];
+export const syncRanks: readonly SyncPresentationKey[] = ["not_linked", "history_mismatch", "no_commits", "not_pushed", "ahead", "behind", "diverged", "in_sync"];
 
 type SortProjection = { bucket: 0 | 1 | 2; rank: number; count: number };
 
 function branchDetail(project: ProjectRecord) {
   return project.git.branch || "Detached HEAD";
+}
+
+function validTimestamp(value: string | null | undefined) {
+  if (!value) return null;
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : null;
+}
+
+export function hasDisconnectedHistory(project: ProjectRecord) {
+  return (project.github.state === "matched" || project.github.state === "linked")
+    && !project.git.hasCommits
+    && validTimestamp(project.github.repository?.pushedAt) !== null;
+}
+
+export type ProjectActivity = {
+  at: string | null;
+  source: "local_commit" | "github_push" | "none";
+  message: string | null;
+};
+
+/** Latest Git activity deliberately excludes filesystem mtimes: moving or
+ * hydrating a folder is not project work. */
+export function projectActivity(project: ProjectRecord): ProjectActivity {
+  const localTime = validTimestamp(project.git.lastCommitAt);
+  const githubTime = validTimestamp(project.github.repository?.pushedAt);
+  if (localTime === null && githubTime === null) return { at: null, source: "none", message: null };
+  if (githubTime !== null && (localTime === null || githubTime > localTime)) {
+    return { at: project.github.repository?.pushedAt || null, source: "github_push", message: null };
+  }
+  return { at: project.git.lastCommitAt, source: "local_commit", message: project.git.lastCommitMessage };
 }
 
 export function gitPresentation(project: ProjectRecord): StatePresentation<GitPresentationKey> {
@@ -38,7 +68,7 @@ export function gitPresentation(project: ProjectRecord): StatePresentation<GitPr
   }
   // HEAD is a tiny metadata read and remains truthful even when the worktree is
   // cloud-backed or slow. It must win over status enumeration failure.
-  if (!project.git.hasCommits) return { key: "no_commits", label: "No commits", detail: project.git.branch || "No branch yet", tone: "warn", resolution: "known", actionable: true, refreshing, count: 0 };
+  if (!project.git.hasCommits) return { key: "no_commits", label: "No local commits", detail: `${project.git.branch || "No branch yet"} · this folder’s .git has no HEAD commit`, tone: "warn", resolution: "known", actionable: true, refreshing, count: 0 };
   if (project.git.statusAvailable) {
     if (project.git.changeCount > 0) {
       const count = project.git.changeCount;
@@ -56,7 +86,7 @@ export function githubPresentation(project: ProjectRecord): StatePresentation<Gi
   const refreshing = project.transient?.github === "checking";
   // A parseable local origin is proof of linkage independent of GitHub auth.
   if (project.github.state === "linked") return { key: "linked", label: "Linked", detail: project.github.repository?.nameWithOwner || "GitHub origin", tone: "good", resolution: "known", actionable: false, refreshing, count: 0 };
-  if (project.github.state === "matched") return { key: "match_found", label: "Repository found", detail: project.github.repository?.nameWithOwner || "Ready to link", tone: "warn", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: 0 };
+  if (project.github.state === "matched") return { key: "match_found", label: "Repository found", detail: `${project.github.repository?.nameWithOwner || "Same-name repository"} · exact-name match only; this folder has no origin`, tone: "warn", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: 0 };
   if (refreshing) return { key: "checking", label: "Checking…", detail: "Looking for GitHub repositories", tone: "checking", resolution: "pending", actionable: false, refreshing: false, count: 0 };
   if (project.github.state === "unavailable") return { key: "sign_in", label: "Sign in to check", detail: "Connect GitHub to discover repositories.", tone: "quiet", resolution: "not_checked", actionable: !project.preferences.localOnly, refreshing: false, count: 0 };
   return { key: "none", label: "No repository", detail: "No linked or matching GitHub repository was found.", tone: "neutral", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: 0 };
@@ -65,6 +95,7 @@ export function githubPresentation(project: ProjectRecord): StatePresentation<Gi
 export function syncPresentation(project: ProjectRecord): StatePresentation<SyncPresentationKey> {
   const refreshing = project.transient?.sync === "checking";
   const state = project.sync.state;
+  if (hasDisconnectedHistory(project)) return { key: "history_mismatch", label: "Histories disconnected", detail: "GitHub has pushed history, but this folder has no local commits. Do not push until its Git metadata is repaired or the repository is cloned again.", tone: "bad", resolution: "known", actionable: false, refreshing, count: 0 };
   if (state === "in_sync") return { key: "in_sync", label: "In sync", detail: project.sync.detail, tone: "good", resolution: "known", actionable: false, refreshing, count: 0 };
   if (state === "ahead") return { key: "ahead", label: `${project.sync.ahead} ahead`, detail: project.sync.detail, tone: "warn", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: project.sync.ahead };
   if (state === "behind") return { key: "behind", label: `${project.sync.behind} behind`, detail: project.sync.detail, tone: "bad", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: project.sync.behind };
@@ -79,7 +110,7 @@ export function syncPresentation(project: ProjectRecord): StatePresentation<Sync
   return { key: "not_checked", label: "Comparison not checked", detail: project.sync.detail || "The linked refs could not be compared.", tone: "quiet", resolution: "not_checked", actionable: false, refreshing: false, count: 0 };
 }
 
-export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "reconcile" | "working_tree_not_checked" | "comparison_not_checked" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
+export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "reconcile" | "review_history" | "working_tree_not_checked" | "comparison_not_checked" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
 
 export function projectActionKey(project: ProjectRecord, githubAvailable: boolean): ProjectActionKey {
   const git = gitPresentation(project);
@@ -87,6 +118,7 @@ export function projectActionKey(project: ProjectRecord, githubAvailable: boolea
   const sync = syncPresentation(project);
   if (git.key === "checking") return "checking_git";
   if (project.preferences.localOnly) return git.key === "not_initialized" ? "init" : "local_only";
+  if (sync.key === "history_mismatch") return "review_history";
   if (git.key === "not_initialized") return github.key === "match_found" ? "link" : "init";
   if (github.key === "match_found") return "link";
   if (github.key === "none" && githubAvailable) return "create";
@@ -117,8 +149,9 @@ export function needsAttention(project: ProjectRecord) {
 export function attentionReason(project: ProjectRecord) {
   const git = gitPresentation(project);
   if (git.key === "checking") return "Local Git status is being checked";
+  if (hasDisconnectedHistory(project)) return "GitHub has commits, but this folder’s local Git history is empty";
   if (git.key === "not_initialized") return "Git is not initialized";
-  if (git.key === "no_commits") return "The repository has no commits";
+  if (git.key === "no_commits") return "This folder has no local commits";
   if (git.key === "changes") return git.label;
   if (project.preferences.localOnly) return "Local Git is settled";
   const github = githubPresentation(project);
