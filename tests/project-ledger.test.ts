@@ -100,10 +100,14 @@ test("pending Git discovery is not mislabeled as a project needing attention", (
   assert.equal(projectInView(pending, "attention"), false);
 });
 
-test("unavailable Git metadata is never presented as a known empty repository", () => {
+test("unavailable Git metadata is neither presented as empty nor treated as actionable by itself", () => {
   const unavailable = project("offloaded", {
     git: { isRepository: true, branch: null, hasCommits: false, changeCount: 0, statusAvailable: false, lastCommitAt: null, lastCommitMessage: null },
   });
   assert.equal(attentionReason(unavailable), "Local Git status is unavailable");
-  assert.equal(needsAttention(unavailable), true);
+  assert.equal(needsAttention(unavailable), false);
+
+  const matched = { ...unavailable, github: { state: "matched" as const, repository: unavailable.github.repository }, sync: { state: "no_remote" as const, ahead: 0, behind: 0, checkedRemote: false, detail: "No remote." } };
+  assert.equal(needsAttention(matched), true);
+  assert.equal(attentionReason(matched), "A GitHub match is ready to link");
 });

@@ -38,7 +38,8 @@ export function gitProjection(project: ProjectRecord) {
 
 export function needsAttention(project: ProjectRecord) {
   if (project.transient?.git === "checking") return false;
-  if (!project.git.isRepository || !project.git.hasCommits || !project.git.statusAvailable || project.git.changeCount > 0) return true;
+  if (!project.git.isRepository) return true;
+  if (project.git.statusAvailable && (!project.git.hasCommits || project.git.changeCount > 0)) return true;
   if (project.preferences.localOnly) return false;
   return project.github.state !== "linked" || project.sync.state !== "in_sync";
 }
@@ -46,12 +47,12 @@ export function needsAttention(project: ProjectRecord) {
 export function attentionReason(project: ProjectRecord) {
   if (project.transient?.git === "checking") return "Local Git status is being checked";
   if (!project.git.isRepository) return "Git is not initialized";
-  if (!project.git.statusAvailable) return "Local Git status is unavailable";
-  if (!project.git.hasCommits) return "The repository has no commits";
-  if (project.git.changeCount > 0) return `${project.git.changeCount} local ${project.git.changeCount === 1 ? "change" : "changes"}`;
-  if (project.preferences.localOnly) return "Local Git is settled";
+  if (project.git.statusAvailable && !project.git.hasCommits) return "The repository has no commits";
+  if (project.git.statusAvailable && project.git.changeCount > 0) return `${project.git.changeCount} local ${project.git.changeCount === 1 ? "change" : "changes"}`;
+  if (project.preferences.localOnly) return project.git.statusAvailable ? "Local Git is settled" : "Local Git status is unavailable";
   if (project.github.state !== "linked") return project.github.state === "matched" ? "A GitHub match is ready to link" : "No GitHub repository is linked";
   if (project.sync.state !== "in_sync") return project.sync.detail;
+  if (!project.git.statusAvailable) return "Local Git status is unavailable";
   return "No attention needed";
 }
 
