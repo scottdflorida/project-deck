@@ -35,7 +35,9 @@ Projects marked **Ignored** are hidden from normal views but remain available in
 the Ignored view and can be restored. Projects marked **Local only** keep their
 local Git information while suppressing GitHub publishing prompts and
 remote-derived attention. Neither preference changes project files, Git remotes,
-or GitHub repositories.
+or GitHub repositories. Every row exposes **Ignore project** in its identity
+section and **Keep local only** in its GitHub column; active projects show the
+inverse **Restore to working set** and **Allow GitHub** actions.
 
 ## Available actions
 

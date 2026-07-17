@@ -137,6 +137,11 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .path-line > span { color: var(--faint); font: 9px var(--font-geist-mono), monospace; text-transform: uppercase; }
 .path-line code { min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; user-select: all; }
 .path-line button { grid-column: 2; width: max-content; min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-dark); font-size: 10px; }
+.working-set-preference { display: flex; align-items: center; gap: 8px; margin: 9px 0 0 45px; }
+.working-set-preference > span { color: var(--faint); font: 8px var(--font-geist-mono), monospace; letter-spacing: .06em; text-transform: uppercase; }
+.working-set-preference button, .rail-preference-button { min-height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; background: transparent; color: var(--muted); font-size: 9px; line-height: 1.2; }
+.working-set-preference button:hover:not(:disabled), .rail-preference-button:hover:not(:disabled) { border-color: var(--ink-2); background: var(--surface-strong); color: var(--ink-2); }
+.working-set-preference button.active, .rail-preference-button.active { border-color: #9ba9d8; background: var(--accent-wash); color: var(--accent-dark); }
 
 .project-facts { display: grid; gap: 13px; padding-top: 2px; }
 .project-facts > div:not(.technology-list) { display: grid; gap: 5px; }
@@ -173,6 +178,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 .rail-column-action .button { width: 100%; min-height: 32px; padding: 5px 7px; font-size: 9px; line-height: 1.25; white-space: normal; }
 .rail-column-action > a { width: max-content; max-width: 100%; display: inline-flex; align-items: center; gap: 4px; color: var(--accent-dark); font-size: 9px; line-height: 1.35; text-decoration: underline; text-underline-offset: 3px; }
 .rail-column-action > small { color: var(--faint); font-size: 8px; line-height: 1.35; }
+.rail-preference-button { width: 100%; margin-top: 8px; padding: 5px 7px; white-space: normal; }
 .project-action-error, .action-dialog-error { display: grid; gap: 5px; padding: 9px 10px; border: 1px solid #dfb4b1; border-radius: 5px; background: var(--bad-wash); color: #7f2e2e; font-size: 10px; line-height: 1.4; }
 .row-action-error { grid-column: 1 / -1; }
 .project-action-error p { margin: 0; overflow-wrap: anywhere; }
@@ -314,7 +320,7 @@ code, time, .kicker { font-family: var(--font-geist-mono), ui-monospace, monospa
 }
 
 @media (pointer: coarse) {
-  .button, .root-action, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .rail-column-action a, .status-evidence summary, .search-field button, .project-action-error button { min-height: 44px; }
+  .button, .root-action, .view-tabs button, .direction-button, .project-menu > summary, .project-menu button, .path-line button, .working-set-preference button, .rail-column-action a, .rail-preference-button, .status-evidence summary, .search-field button, .project-action-error button { min-height: 44px; }
   .rail-column-action a, .status-evidence summary { display: inline-flex; align-items: center; }
 }
 
