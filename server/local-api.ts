@@ -12,6 +12,7 @@ import {
   getGithubAuthentication,
   getProjectsRoot,
   openProjectsRoot,
+  pullProject,
   scanProjectsProgressively,
   scanProjectsQuick,
   setProjectsRoot,
@@ -146,7 +147,7 @@ async function readBody(request: IncomingMessage) {
 
 function routeParts(url: URL) {
   const match = url.pathname.match(
-    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|push|preferences)$/u,
+    /^\/api\/projects\/([^/]+)\/(init|link|create-repo|pull|push|preferences)$/u,
   );
   if (!match) return null;
   try {
@@ -258,6 +259,9 @@ const server = createServer(async (request, response) => {
             route.name,
             typeof body.message === "string" ? body.message : "",
           );
+          break;
+        case "pull":
+          result = await pullProject(route.name);
           break;
         case "preferences":
           result = await setProjectPreferences(route.name, {

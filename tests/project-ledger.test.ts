@@ -192,6 +192,32 @@ test("action guidance never calls an unchecked working tree up to date", () => {
   assert.equal(projectActionKey(offloaded, true), "working_tree_not_checked");
 });
 
+test("separates committed sync from uncommitted working-tree changes", () => {
+  const dirtyButCommittedHistoryMatches = project("dirty", {
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 3, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    sync: { state: "in_sync", ahead: 0, behind: 0, checkedRemote: true, detail: "Local and GitHub commits match." },
+  });
+
+  const presentation = syncPresentation(dirtyButCommittedHistoryMatches);
+  assert.equal(presentation.label, "Commits in sync");
+  assert.match(presentation.detail, /3 uncommitted local changes/);
+  assert.equal(presentation.tone, "warn");
+  assert.equal(projectActionKey(dirtyButCommittedHistoryMatches, true), "push");
+});
+
+test("offers pull only when a behind branch has a checked, clean worktree", () => {
+  const behind = project("behind", {
+    sync: { state: "behind", ahead: 0, behind: 25, checkedRemote: true, detail: "25 commits behind." },
+  });
+  const dirty = project("dirty-behind", {
+    git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 1, statusAvailable: true, lastCommitAt: null, lastCommitMessage: null },
+    sync: { state: "behind", ahead: 0, behind: 25, checkedRemote: true, detail: "25 commits behind." },
+  });
+
+  assert.equal(projectActionKey(behind, true), "pull");
+  assert.equal(projectActionKey(dirty, true), "reconcile");
+});
+
 test("agent-managed Git is labeled truthfully and routes mutations back to the coding session", () => {
   const external = project("agent-project", {
     git: { isRepository: true, branch: "main", hasCommits: true, changeCount: 2, statusAvailable: true, metadataSource: "agent_external", lastCommitAt: "2026-07-17T10:00:00.000Z", lastCommitMessage: "Agent update" },

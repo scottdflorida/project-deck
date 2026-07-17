@@ -299,7 +299,7 @@ function preferenceFor(canonicalPath: string) {
 function assertGithubActionAllowed(name: string, canonicalPath: string, action: string) {
   if (!preferenceFor(canonicalPath).localOnly) return;
   throw new ProjectActionError(
-    `${name} is marked Local only. Choose Allow GitHub before ${action}. No repository action was run.`,
+    `${name} is set to ignore GitHub actions. Resume GitHub sync before ${action}. No repository action was run.`,
     409,
     { code: "local_only" },
   );
@@ -1736,9 +1736,9 @@ export async function setProjectPreferences(
       : patch.ignored === false
         ? `${name} restored to the working set.`
         : patch.localOnly === true
-          ? `${name} will stay local only.`
+          ? `${name} will ignore GitHub publishing and sync alerts.`
           : patch.localOnly === false
-            ? `GitHub publishing is allowed for ${name}.`
+            ? `GitHub publishing and sync actions are enabled for ${name}.`
             : patch.description === null
               ? `Local description cleared for ${name}.`
               : `Local description saved for ${name}.`,
@@ -1921,6 +1921,64 @@ type CommitPushOptions = {
   execute?: typeof run;
   refresh?: (name: string) => Promise<ProjectRecord>;
 };
+
+type PullOptions = {
+  execute?: typeof run;
+  refresh?: (name: string) => Promise<ProjectRecord>;
+};
+
+/** Safely bring a strictly-behind branch forward. This deliberately refuses
+ * dirty, ahead, diverged, detached, non-GitHub, and agent-external worktrees. */
+export async function pullProject(name: string, options: PullOptions = {}) {
+  const { root, projectPath, canonicalPath } = await resolveProject(name);
+  await assertFolderManagedGit(root, projectPath);
+  assertGithubActionAllowed(name, canonicalPath, "pulling from GitHub");
+  const execute = options.execute || run;
+  const refresh = options.refresh || refreshedProject;
+  if (!(await exists(path.join(projectPath, ".git")))) {
+    throw new ProjectActionError("Initialize Git before pulling this project.", 409);
+  }
+
+  const origin = await execute("git", ["remote", "get-url", "origin"], projectPath);
+  if (!origin.ok || !parseGithubRemote(origin.stdout)) {
+    throw new ProjectActionError("Link a GitHub repository before pulling.", 409);
+  }
+  const branchResult = await execute("git", ["branch", "--show-current"], projectPath);
+  const branch = branchResult.stdout;
+  if (!branch) throw new ProjectActionError("Choose a branch before pulling this repository.", 409);
+
+  const status = await execute("git", ["status", "--porcelain"], projectPath, 15_000);
+  if (!status.ok) {
+    throw new ProjectActionError(friendlyCommandError(status, "The working tree could not be checked before pulling."), 409);
+  }
+  if (status.stdout) {
+    throw new ProjectActionError("Commit or stash local changes before pulling. No files were changed.", 409, { code: "pull_dirty" });
+  }
+
+  const fetched = await execute("git", ["fetch", "--quiet", "--prune", "origin"], projectPath, 30_000);
+  if (!fetched.ok) {
+    throw new ProjectActionError(friendlyCommandError(fetched, "GitHub could not be fetched. No local files were changed."), 409, { code: "pull_fetch_failed" });
+  }
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  const remoteBranch = await execute("git", ["show-ref", "--verify", remoteRef], projectPath);
+  if (!remoteBranch.ok) throw new ProjectActionError(`GitHub does not have a ${branch} branch to pull.`, 409);
+
+  const comparison = await execute("git", ["rev-list", "--left-right", "--count", `origin/${branch}...HEAD`], projectPath);
+  if (!comparison.ok) throw new ProjectActionError("Local and GitHub history could not be compared safely. No files were changed.", 409);
+  const [behind = 0, ahead = 0] = comparison.stdout.split(/\s+/u).map((value) => Number.parseInt(value, 10) || 0);
+  if (behind === 0 && ahead === 0) return { message: "Already up to date.", project: await refresh(name) };
+  if (ahead > 0 && behind > 0) throw new ProjectActionError("Local and GitHub history have diverged. Reconcile them manually; no files were changed.", 409, { code: "pull_diverged" });
+  if (ahead > 0) throw new ProjectActionError("This branch has local commits that are not on GitHub. Push them instead of pulling.", 409);
+
+  const merged = await execute("git", ["merge", "--ff-only", remoteRef], projectPath, 30_000);
+  if (!merged.ok) {
+    throw new ProjectActionError(friendlyCommandError(merged, "The branch could not be fast-forwarded. No merge commit was created."), 409, { code: "pull_failed", project: await refresh(name) });
+  }
+  return {
+    message: `Pulled ${behind} remote commit${behind === 1 ? "" : "s"} with a fast-forward update.`,
+    project: await refresh(name),
+  };
+}
 
 export async function commitAndPushProject(name: string, requestedMessage: string, options: CommitPushOptions = {}) {
   const { root, projectPath, canonicalPath } = await resolveProject(name);

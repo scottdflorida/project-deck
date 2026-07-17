@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
+import { canonicalizeProjectPath, commitAndPushProject, compactDescription, createGithubRepository, descriptionFromOverview, discoverExternalGitDirectories, discoverProjectDescription, getSyncState, includesTrackedOffloadedPath, initializeProject, linkMatchedRepository, loadProjectsRoot, preserveKnownProjectSize, ProjectActionError, pullProject, scanProjects, scanProjectsProgressively, scanProjectsQuick, setProjectPreferences } from "../server/project-scanner";
 import type { ProjectRecord } from "../lib/project-types";
 import { measureProjectSize } from "../server/project-scanner";
 import { formatProjectSize } from "../lib/format-project-size";
@@ -435,9 +435,10 @@ test("server-side local-only intent blocks every GitHub mutation while allowing 
     for (const operation of [
       () => linkMatchedRepository("atlas"),
       () => createGithubRepository("atlas", "private"),
+      () => pullProject("atlas"),
       () => commitAndPushProject("atlas", "Initial commit"),
     ]) {
-      await assert.rejects(operation, (error: unknown) => error instanceof ProjectActionError && error.code === "local_only" && /atlas is marked Local only/u.test(error.message));
+      await assert.rejects(operation, (error: unknown) => error instanceof ProjectActionError && error.code === "local_only" && /atlas is set to ignore GitHub actions/u.test(error.message));
     }
   } finally {
     if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
@@ -459,6 +460,44 @@ function actionFixture(name: string, patch: Partial<ProjectRecord> = {}): Projec
     ...patch,
   };
 }
+
+test("pull fast-forwards a strictly-behind clean branch and refuses a dirty worktree", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "project-pull-test-")); const root = path.join(temp, "root"); const projectPath = path.join(root, "atlas");
+  const oldRoot = process.env.GIT_SCAN_ROOT; const oldSettings = process.env.GIT_SCAN_SETTINGS_PATH; const oldGithub = process.env.GIT_SCAN_DISABLE_GITHUB;
+  process.env.GIT_SCAN_ROOT = root; process.env.GIT_SCAN_SETTINGS_PATH = path.join(temp, "settings.json"); process.env.GIT_SCAN_DISABLE_GITHUB = "1";
+  try {
+    await mkdir(path.join(projectPath, ".git"), { recursive: true }); await loadProjectsRoot();
+    const calls: string[] = [];
+    const execute = async (_command: string, args: string[]) => {
+      const key = args.join(" "); calls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "status --porcelain") return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+      if (key === "rev-list --left-right --count origin/main...HEAD") return { ok: true, stdout: "25 0", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    const pulled = await pullProject("atlas", { execute, refresh: async () => actionFixture("atlas", { sync: { state: "in_sync", ahead: 0, behind: 0, checkedRemote: true, detail: "In sync." } }) });
+    assert.equal(pulled.message, "Pulled 25 remote commits with a fast-forward update.");
+    assert.equal(calls.includes("fetch --quiet --prune origin"), true);
+    assert.equal(calls.includes("merge --ff-only refs/remotes/origin/main"), true);
+
+    const dirtyCalls: string[] = [];
+    const dirty = async (_command: string, args: string[]) => {
+      const key = args.join(" "); dirtyCalls.push(key);
+      if (key === "remote get-url origin") return { ok: true, stdout: "https://github.com/person/atlas.git", stderr: "", exitCode: 0 };
+      if (key === "branch --show-current") return { ok: true, stdout: "main", stderr: "", exitCode: 0 };
+      if (key === "status --porcelain") return { ok: true, stdout: " M app.ts", stderr: "", exitCode: 0 };
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+    await assert.rejects(() => pullProject("atlas", { execute: dirty }), (error: unknown) => error instanceof ProjectActionError && error.code === "pull_dirty");
+    assert.equal(dirtyCalls.some((call) => call.startsWith("fetch ") || call.startsWith("merge ")), false);
+  } finally {
+    if (oldRoot === undefined) delete process.env.GIT_SCAN_ROOT; else process.env.GIT_SCAN_ROOT = oldRoot;
+    if (oldSettings === undefined) delete process.env.GIT_SCAN_SETTINGS_PATH; else process.env.GIT_SCAN_SETTINGS_PATH = oldSettings;
+    if (oldGithub === undefined) delete process.env.GIT_SCAN_DISABLE_GITHUB; else process.env.GIT_SCAN_DISABLE_GITHUB = oldGithub;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("initial commit push failure reports partial truth and a retry never repeats the commit", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "project-initial-push-test-")); const root = path.join(temp, "root"); const projectPath = path.join(root, "atlas");

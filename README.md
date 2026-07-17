@@ -32,12 +32,22 @@ files.
 next to the visible path rather than presented as an unexplained project action.
 
 Projects marked **Ignored** are hidden from normal views but remain available in
-the Ignored view and can be restored. Projects marked **Local only** keep their
-local Git information while suppressing GitHub publishing prompts and
-remote-derived attention. Neither preference changes project files, Git remotes,
-or GitHub repositories. Every row exposes **Ignore project** in its identity
-section and **Keep local only** in its GitHub column; active projects show the
-inverse **Restore to working set** and **Allow GitHub** actions.
+the Ignored view and can be restored. Projects without a GitHub repository can
+be marked **Local only**, which keeps their local Git information visible while
+suppressing GitHub publishing prompts and remote-derived attention. Neither
+preference changes project files, Git remotes, or GitHub repositories. Every row
+exposes **Ignore project** in its identity section. A project without a repository
+offers **Keep local only**; when a repository already exists, that control is
+instead labeled **Ignore GitHub sync** because the remote is not changed or made
+“local only.” **Resume GitHub sync** reverses that preference.
+
+Sync labels separate committed history from working-tree changes. **In sync**
+means the local and GitHub commit histories match and the working tree is clean.
+**Commits in sync** means those histories match but uncommitted local changes
+still exist, so the row offers **Commit & push N changes**. A clean branch that
+is behind GitHub offers **Pull N commits**. Pull is deliberately conservative:
+it fetches and performs a fast-forward-only update, and refuses to run when the
+working tree is dirty or the histories have diverged.
 
 ## Available actions
 
@@ -48,6 +58,7 @@ guidance under **Sync**. There is no separate catch-all action column.
 - Initialize a folder as a Git repository on `main`
 - Link an exact-name repository already in your GitHub account
 - Create a private or public GitHub repository
+- Pull remote commits with a clean, fast-forward-only update
 - Stage, commit, and push local changes
 
 Pushes stop when the remote branch is ahead or diverged. Obvious untracked

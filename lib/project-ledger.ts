@@ -97,7 +97,22 @@ export function syncPresentation(project: ProjectRecord): StatePresentation<Sync
   const refreshing = project.transient?.sync === "checking";
   const state = project.sync.state;
   if (hasDisconnectedHistory(project)) return { key: "history_mismatch", label: "Histories disconnected", detail: "GitHub has pushed history, but this folder has no local commits. Do not push until its Git metadata is repaired or the repository is cloned again.", tone: "bad", resolution: "known", actionable: false, refreshing, count: 0 };
-  if (state === "in_sync") return { key: "in_sync", label: "In sync", detail: project.sync.detail, tone: "good", resolution: "known", actionable: false, refreshing, count: 0 };
+  if (state === "in_sync") {
+    if (project.git.statusAvailable && project.git.changeCount > 0) {
+      const count = project.git.changeCount;
+      return {
+        key: "in_sync",
+        label: "Commits in sync",
+        detail: `Committed history matches GitHub. ${count} uncommitted local ${count === 1 ? "change is" : "changes are"} not included yet.`,
+        tone: "warn",
+        resolution: "known",
+        actionable: true,
+        refreshing,
+        count,
+      };
+    }
+    return { key: "in_sync", label: "In sync", detail: project.sync.detail, tone: "good", resolution: "known", actionable: false, refreshing, count: 0 };
+  }
   if (state === "ahead") return { key: "ahead", label: `${project.sync.ahead} ahead`, detail: project.sync.detail, tone: "warn", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: project.sync.ahead };
   if (state === "behind") return { key: "behind", label: `${project.sync.behind} behind`, detail: project.sync.detail, tone: "bad", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: project.sync.behind };
   if (state === "diverged") return { key: "diverged", label: `${project.sync.ahead} ahead · ${project.sync.behind} behind`, detail: project.sync.detail, tone: "bad", resolution: "known", actionable: !project.preferences.localOnly, refreshing, count: project.sync.ahead + project.sync.behind };
@@ -111,7 +126,7 @@ export function syncPresentation(project: ProjectRecord): StatePresentation<Sync
   return { key: "not_checked", label: "Comparison not checked", detail: project.sync.detail || "The linked refs could not be compared.", tone: "quiet", resolution: "not_checked", actionable: false, refreshing: false, count: 0 };
 }
 
-export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "reconcile" | "review_history" | "working_tree_not_checked" | "comparison_not_checked" | "external_session" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
+export type ProjectActionKey = "checking_git" | "init" | "link" | "create" | "checking_sync" | "pull" | "reconcile" | "review_history" | "working_tree_not_checked" | "comparison_not_checked" | "external_session" | "push" | "up_to_date" | "connect_github" | "local_only" | "none";
 
 export function projectActionKey(project: ProjectRecord, githubAvailable: boolean): ProjectActionKey {
   const git = gitPresentation(project);
@@ -126,7 +141,8 @@ export function projectActionKey(project: ProjectRecord, githubAvailable: boolea
   if (github.key === "none" && githubAvailable) return "create";
   if (github.key === "linked") {
     if (sync.key === "checking") return "checking_sync";
-    if (sync.key === "behind" || sync.key === "diverged") return "reconcile";
+    if (sync.key === "behind") return project.git.statusAvailable && project.git.changeCount === 0 ? "pull" : "reconcile";
+    if (sync.key === "diverged") return "reconcile";
     if (sync.key === "not_checked") return "comparison_not_checked";
     if (git.key === "no_commits" || git.key === "changes" || sync.key === "ahead" || sync.key === "not_pushed") return "push";
     if (git.key === "offloaded" || git.key === "not_checked") return "working_tree_not_checked";

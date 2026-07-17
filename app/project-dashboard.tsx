@@ -9,16 +9,16 @@ import { AlertCircle, ArrowDown, ArrowUp, Check, Copy, ExternalLink, Folder, Git
 const RETRY_MS = 4_000;
 const API_TIMEOUT_MS = 5_000;
 const API_PORT = process.env.NEXT_PUBLIC_PROJECT_DECK_API_PORT || "4317";
-const viewLabels: Record<ProjectView, string> = { working: "Working set", attention: "Needs attention", local: "Local only", ignored: "Ignored" };
+const viewLabels: Record<ProjectView, string> = { working: "Working set", attention: "Needs attention", local: "GitHub ignored", ignored: "Ignored" };
 const sortLabels: Record<SortKey, string> = { name: "Project", size: "Total size", git: "Git", github: "GitHub", sync: "Sync" };
 type GithubAuthState = { checked: boolean; cliAvailable: boolean; connected: boolean; login: string | null };
-type ProjectActionKind = "init" | "link" | "create-repo" | "push" | "preferences";
-type RepoModal = { type: "create" | "link" | "push"; project: ProjectRecord; trigger: HTMLElement | null };
+type ProjectActionKind = "init" | "link" | "create-repo" | "pull" | "push" | "preferences";
+type RepoModal = { type: "create" | "link" | "pull" | "push"; project: ProjectRecord; trigger: HTMLElement | null };
 type PreferenceModal = { type: "preference"; kind: "ignored" | "localOnly"; project: ProjectRecord; trigger: HTMLElement | null };
 type DescriptionModal = { type: "description"; project: ProjectRecord; trigger: HTMLElement | null };
 type ModalState = RepoModal | PreferenceModal | DescriptionModal | null;
 type ProjectActionFailure = { projectPath: string; projectName: string; kind: ProjectActionKind; label: string; message: string; code?: string };
-const actionLabels: Record<ProjectActionKind, string> = { init: "Initialize Git", link: "Link repository", "create-repo": "Create GitHub repository", push: "Publish to GitHub", preferences: "Update project preference" };
+const actionLabels: Record<ProjectActionKind, string> = { init: "Initialize Git", link: "Link repository", "create-repo": "Create GitHub repository", pull: "Pull from GitHub", push: "Publish to GitHub", preferences: "Update project preference" };
 
 function apiUrl(path: string) {
   if (typeof window === "undefined") return path;
@@ -94,8 +94,9 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
   useEffect(() => { if (wasBusy.current && !busy && error) submit.current?.focus(); wasBusy.current = busy; }, [busy, error]);
   const create = modal.type === "create";
   const link = modal.type === "link";
+  const pull = modal.type === "pull";
   const emptyInitial = !modal.project.git.hasCommits && modal.project.git.changeCount === 0;
-  const title = create ? "Create a GitHub repository" : link ? modal.project.git.isRepository ? "Link repository" : "Initialize & link" : emptyInitial ? "Create initial commit & push" : modal.project.git.changeCount ? "Commit & push" : "Push to GitHub";
+  const title = create ? "Create a GitHub repository" : link ? modal.project.git.isRepository ? "Link repository" : "Initialize & link" : pull ? `Pull ${modal.project.sync.behind} remote commit${modal.project.sync.behind === 1 ? "" : "s"}` : emptyInitial ? "Create initial commit & push" : modal.project.git.changeCount ? `Commit & push ${modal.project.git.changeCount} local change${modal.project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
   const matchedRepository = modal.project.github.repository?.nameWithOwner || "the matched GitHub repository";
   const consequence = create
     ? modal.project.git.isRepository
@@ -105,6 +106,8 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
       ? modal.project.git.isRepository
         ? `This adds ${matchedRepository} as origin. It does not change project files or commits.`
         : `This initializes local Git and adds ${matchedRepository} as origin. It does not change project files or create commits.`
+      : pull
+        ? `This fetches GitHub and fast-forwards ${modal.project.git.branch || "the current branch"} by ${modal.project.sync.behind} commit${modal.project.sync.behind === 1 ? "" : "s"}. It refuses to run if there are local changes or the histories have diverged.`
       : emptyInitial
         ? "This project has no commits or file changes. Project Deck may create an empty initial commit, then push it to the linked GitHub repository."
         : !modal.project.git.hasCommits
@@ -116,20 +119,21 @@ function RepoActionModal({ modal, busy, error, onClose, onSubmit }: { modal: Rep
     <p className="kicker">REPOSITORY ACTION · {modal.project.name}</p><h2 id="repo-dialog-title">{title}</h2>
     <p>{consequence}</p>
     {create ? <div className="choice-grid" role="radiogroup" aria-label="Repository visibility">{(["private", "public"] as const).map((value) => <button key={value} data-dialog-initial={value === "private" ? "true" : undefined} role="radio" aria-checked={visibility === value} className={visibility === value ? "selected" : ""} onClick={() => setVisibility(value)}>{value === "private" ? <Lock size={17}/> : <Unlock size={17}/>}<span><strong>{value === "private" ? "Private" : "Public"}</strong><small>{value === "private" ? "Only invited people" : "Visible to everyone"}</small></span>{visibility === value && <Check size={17}/>}</button>)}</div>
-      : !link && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && <label className="field"><span>Commit message</span><input data-dialog-initial="true" value={message} maxLength={120} onChange={(event) => setMessage(event.target.value)} /><small>Obvious untracked secret files are blocked before staging.</small></label>}
+      : !link && !pull && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && <label className="field"><span>Commit message</span><input data-dialog-initial="true" value={message} maxLength={120} onChange={(event) => setMessage(event.target.value)} /><small>Obvious untracked secret files are blocked before staging.</small></label>}
     {error && error.projectPath === modal.project.canonicalPath && <div className="action-dialog-error" role="alert"><strong>{error.label} failed for {error.projectName}</strong><span>{error.message}</span></div>}
-    <div className="dialog-actions"><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button ref={submit} data-dialog-initial={link ? "true" : undefined} className="button primary" disabled={busy || (!create && !link && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && !message.trim())} onClick={() => onSubmit(create ? { visibility } : link ? {} : { message })}>{busy ? <LoaderCircle className="spin" size={15}/> : create || link ? <Github size={15}/> : <ArrowUp size={15}/>} {busy ? "Working…" : title}</button></div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button ref={submit} data-dialog-initial={link || pull ? "true" : undefined} className="button primary" disabled={busy || (!create && !link && !pull && (modal.project.git.changeCount > 0 || !modal.project.git.hasCommits) && !message.trim())} onClick={() => onSubmit(create ? { visibility } : link || pull ? {} : { message })}>{busy ? <LoaderCircle className="spin" size={15}/> : create || link ? <Github size={15}/> : pull ? <ArrowDown size={15}/> : <ArrowUp size={15}/>} {busy ? "Working…" : title}</button></div>
   </DialogFrame>;
 }
 
 function PreferenceDialog({ modal, busy, error, onClose, onConfirm }: { modal: PreferenceModal; busy: boolean; error: ProjectActionFailure | null; onClose: () => void; onConfirm: () => void }) {
   const isIgnore = modal.kind === "ignored";
   const active = modal.project.preferences[modal.kind];
-  const title = isIgnore ? active ? "Restore to working set" : "Ignore project" : active ? "Allow GitHub" : "Keep local only";
+  const hasGithubRepository = Boolean(modal.project.github.repository) || modal.project.github.state === "linked" || modal.project.github.state === "matched";
+  const title = isIgnore ? active ? "Restore to working set" : "Ignore project" : active ? hasGithubRepository ? "Resume GitHub sync" : "Allow GitHub" : hasGithubRepository ? "Ignore GitHub sync" : "Keep local only";
   const copy = isIgnore
     ? active ? "This returns the project to the working set. Nothing in its folder will change." : "This hides the project from normal working-set views. It remains on disk, scanned, searchable in Ignored, and can be restored."
-    : active ? "GitHub publishing prompts and remote attention will return. No repository action will run until you choose one." : modal.project.github.state === "linked"
-      ? "This keeps the existing GitHub repository and remote unchanged. Project Deck will stop suggesting GitHub publishing and ignore remote sync when deciding whether this project needs attention."
+    : active ? "GitHub publishing, pull actions, and remote attention will return. No repository action will run until you choose one." : hasGithubRepository
+      ? "This keeps the existing GitHub repository and remote unchanged. Project Deck will hide push and pull actions and ignore remote sync when deciding whether this project needs attention."
       : "Project Deck will stop suggesting GitHub publishing. Local Git remains available and no repository action will run.";
   return <DialogFrame titleId="preference-title" busy={busy} onClose={onClose}><p className="kicker">PROJECT INTENT · {modal.project.name}</p><h2 id="preference-title">{title}</h2><p>{copy}</p>{error?.projectPath === modal.project.canonicalPath && <div className="action-dialog-error" role="alert"><strong>{error.label} failed for {error.projectName}</strong><span>{error.message}</span></div>}<div className="dialog-actions"><button className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button data-dialog-initial="true" className="button primary" onClick={onConfirm} disabled={busy}>{busy && <LoaderCircle className="spin" size={15}/>} {title}</button></div></DialogFrame>;
 }
@@ -150,8 +154,8 @@ function GitColumnAction({ project, busy, onAction }: { project: ProjectRecord; 
 function GithubColumnAction({ project, githubAvailable, busy, onModal }: { project: ProjectRecord; githubAvailable: boolean; busy: boolean; onModal: (modal: RepoModal) => void }) {
   const github = githubPresentation(project);
   if (project.preferences.localOnly) return project.github.repository
-    ? <div className="rail-column-action"><a href={project.github.repository.url} target="_blank" rel="noreferrer">Open repository <ExternalLink size={12}/></a><small>GitHub suggestions hidden by Local only</small></div>
-    : <span className="action-guidance"><Check size={13}/> Local only</span>;
+    ? <div className="rail-column-action"><a href={project.github.repository.url} target="_blank" rel="noreferrer">Open repository <ExternalLink size={12}/></a><small>GitHub sync actions and alerts are ignored</small></div>
+    : <span className="action-guidance"><Check size={13}/> GitHub publishing ignored</span>;
   if (github.key === "checking") return <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Finding repositories…</span>;
   if (github.key === "linked") return project.github.repository ? <div className="rail-column-action"><a href={project.github.repository.url} target="_blank" rel="noreferrer">Open repository <ExternalLink size={12}/></a></div> : null;
   if (project.git.metadataSource === "agent_external") return <div className="rail-column-action">
@@ -169,6 +173,10 @@ function GithubColumnAction({ project, githubAvailable, busy, onModal }: { proje
 
 function GithubPreferenceControl({ project, busy, onModal }: { project: ProjectRecord; busy: boolean; onModal: (modal: PreferenceModal) => void }) {
   const localOnly = project.preferences.localOnly;
+  const hasGithubRepository = Boolean(project.github.repository) || project.github.state === "linked" || project.github.state === "matched";
+  const label = localOnly
+    ? hasGithubRepository ? "Resume GitHub sync" : "Allow GitHub"
+    : hasGithubRepository ? "Ignore GitHub sync" : "Keep local only";
   return <button
     className={`rail-preference-button ${localOnly ? "active" : ""}`}
     type="button"
@@ -176,7 +184,7 @@ function GithubPreferenceControl({ project, busy, onModal }: { project: ProjectR
     disabled={busy}
     onClick={(event) => onModal({ type: "preference", kind: "localOnly", project, trigger: event.currentTarget })}
   >
-    {localOnly ? <Unlock size={13}/> : <Lock size={13}/>} {localOnly ? "Allow GitHub" : "Keep local only"}
+    {localOnly ? <Unlock size={13}/> : <Lock size={13}/>} {label}
   </button>;
 }
 
@@ -186,13 +194,18 @@ function SyncColumnAction({ project, busy, onModal }: { project: ProjectRecord; 
   const externallyManaged = project.git.metadataSource === "agent_external";
   let action: React.ReactNode = null;
   if (sync.key === "history_mismatch") action = <span className="action-guidance danger"><AlertCircle size={13}/> Review the evidence below before pushing</span>;
+  else if (project.preferences.localOnly) action = <span className="action-guidance"><Check size={13}/> Sync actions and alerts ignored</span>;
   else if (sync.key === "checking") action = <span className="action-guidance"><LoaderCircle className="spin" size={13}/> Comparing refs…</span>;
-  else if (sync.key === "behind" || sync.key === "diverged") action = <span className="action-guidance caution">Reconcile outside Project Deck, then refresh</span>;
+  else if (sync.key === "behind" && externallyManaged) action = <span className="action-guidance caution">Pull through the active coding session</span>;
+  else if (sync.key === "behind" && (!project.git.statusAvailable || git.key === "offloaded" || git.key === "not_checked")) action = <span className="action-guidance">Make working files available, then refresh before pulling</span>;
+  else if (sync.key === "behind" && project.git.changeCount > 0) action = <span className="action-guidance caution">Commit or stash local changes before pulling</span>;
+  else if (sync.key === "behind") action = <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "pull", project, trigger: event.currentTarget })}><ArrowDown size={14}/> Pull {project.sync.behind} commit{project.sync.behind === 1 ? "" : "s"}</button></div>;
+  else if (sync.key === "diverged") action = <span className="action-guidance caution">Histories diverged — reconcile outside Project Deck</span>;
   else if (git.key === "offloaded" || git.key === "not_checked") action = <span className="action-guidance">Make working files available, then refresh</span>;
   else if (sync.key === "not_checked") action = <span className="action-guidance">Refresh to check the comparison again</span>;
   else if (externallyManaged && (git.key === "changes" || git.key === "no_commits" || sync.key === "ahead" || sync.key === "not_pushed")) action = <span className="action-guidance caution">Commit and push through the active coding session</span>;
   else if (project.github.state === "linked" && (git.key === "no_commits" || git.key === "changes" || sync.key === "ahead" || sync.key === "not_pushed")) {
-    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Initial commit & push" : project.git.changeCount ? "Commit & push" : "Push to GitHub";
+    const label = !project.git.hasCommits ? project.git.changeCount ? "Commit & push" : "Initial commit & push" : project.git.changeCount ? `Commit & push ${project.git.changeCount} change${project.git.changeCount === 1 ? "" : "s"}` : "Push to GitHub";
     action = <div className="rail-column-action"><button className="button primary" disabled={busy} onClick={(event) => onModal({ type: "push", project, trigger: event.currentTarget })}><ArrowUp size={14}/> {label}</button></div>;
   } else if (sync.key === "in_sync") action = <span className="action-guidance good"><Check size={13}/> Up to date</span>;
   else if (sync.key === "not_linked" && project.github.state === "matched") action = <span className="action-guidance">Link the repository in the GitHub column</span>;
@@ -222,7 +235,7 @@ function ProjectRow({ project, githubAvailable, busy, actionError, onAction, onC
   return <li className="project-row" data-project={project.name} data-project-path={project.canonicalPath}>
     <article className="project-record" aria-labelledby={`project-${encodeURIComponent(project.canonicalPath)}`}>
       <div className="project-identity">
-        <div className="identity-heading"><span className="project-index" aria-hidden="true">{project.name.slice(0, 2).toUpperCase()}</span><div><h2 id={`project-${encodeURIComponent(project.canonicalPath)}`}>{project.name}</h2><div className="intent-list">{project.preferences.localOnly && <span>Local only</span>}{project.preferences.ignored && <span>Ignored</span>}{needsAttention(project) && !project.preferences.ignored && <span className="attention-intent">Needs attention</span>}</div></div><details className="project-menu" onKeyDown={(event) => { if (event.key === "Escape") { event.currentTarget.removeAttribute("open"); event.currentTarget.querySelector<HTMLElement>("summary")?.focus(); } }}><summary role="button" aria-label={`Description options for ${project.name}`}><MoreHorizontal size={18}/></summary><div role="menu"><button role="menuitem" onClick={(event) => onModal({ type: "description", project, trigger: event.currentTarget })}><Pencil size={14}/> {descriptionMissing ? "Add local description" : "Edit local description"}</button></div></details></div>
+        <div className="identity-heading"><span className="project-index" aria-hidden="true">{project.name.slice(0, 2).toUpperCase()}</span><div><h2 id={`project-${encodeURIComponent(project.canonicalPath)}`}>{project.name}</h2><div className="intent-list">{project.preferences.localOnly && <span>{project.github.repository ? "Sync ignored" : "Local only"}</span>}{project.preferences.ignored && <span>Ignored</span>}{needsAttention(project) && !project.preferences.ignored && <span className="attention-intent">Needs attention</span>}</div></div><details className="project-menu" onKeyDown={(event) => { if (event.key === "Escape") { event.currentTarget.removeAttribute("open"); event.currentTarget.querySelector<HTMLElement>("summary")?.focus(); } }}><summary role="button" aria-label={`Description options for ${project.name}`}><MoreHorizontal size={18}/></summary><div role="menu"><button role="menuitem" onClick={(event) => onModal({ type: "description", project, trigger: event.currentTarget })}><Pencil size={14}/> {descriptionMissing ? "Add local description" : "Edit local description"}</button></div></details></div>
         <div className={`description ${descriptionMissing ? "missing" : ""}`}>{project.description.source === "checking" ? <p>Checking local description…</p> : descriptionMissing ? <><p>No suitable local description found</p><button onClick={(event) => onModal({ type: "description", project, trigger: event.currentTarget })}>Add local description</button></> : <><p aria-label={project.description.text}>{project.description.compact}</p><span>{project.description.sourceLabel}</span></>}</div>
         <div className="path-line"><span>Folder path</span><code>{project.canonicalPath}</code><button onClick={() => onCopy(project)} aria-label={`Copy absolute folder path for ${project.name}`}><Copy size={13}/> Copy folder path</button></div>
         <div className="working-set-preference"><span>Working set</span><button type="button" className={project.preferences.ignored ? "active" : ""} aria-pressed={project.preferences.ignored} disabled={busy} onClick={(event) => onModal({ type: "preference", kind: "ignored", project, trigger: event.currentTarget })}>{project.preferences.ignored ? "Restore to working set" : "Ignore project"}</button></div>
@@ -371,7 +384,7 @@ export function ProjectDashboard() {
     {!loading && !data && scannerError && <div className="state-surface" role="status"><AlertCircle/><p className="kicker">LOCAL SERVICE · OFFLINE</p><h3>Project Deck could not reach the local service</h3><p>{retryPending ? "Trying once more. This page will stay usable while Project Deck checks again." : retryExhausted ? "Restart Project Deck, then retry. No project files or settings were changed." : "The local project service did not respond."}</p><button className="button primary" onClick={() => void loadProjects(false, true)}><RefreshCw size={15}/> Retry now</button></div>}
     {!loading && data && emptyKind && <div className="state-surface"><Folder/><p className="kicker">{emptyKind === "root" ? "ROOT · EMPTY" : emptyKind === "ignored-only" ? "WORKING SET · EMPTY" : "VIEW · EMPTY"}</p><h3>{emptyKind === "root" ? "No project folders found" : emptyKind === "ignored-only" ? "Every project is ignored" : emptyKind === "query" ? `No matches in ${viewLabels[view]}` : `${viewLabels[view]} is empty`}</h3><p>{emptyKind === "root" ? `${data.rootLabel} is available, but it contains no direct child folders.` : emptyKind === "ignored-only" ? "Nothing was deleted. Your projects remain on disk and are available in Ignored." : emptyKind === "query" ? "Clear the search to return to this view without changing its sort or scope." : view === "ignored" ? "Ignored projects will appear here and can be restored." : "No projects currently meet this view’s rules."}</p>{emptyKind === "ignored-only" ? <button className="button primary" onClick={() => setView("ignored")}>Show ignored projects</button> : emptyKind === "query" ? <button className="button secondary" onClick={() => setQuery("")}>Clear search</button> : null}</div>}</section></div>
     <div className="sr-only" role="status" aria-live="polite">{refreshing ? "Refreshing project facts" : toast || ""}</div>{toast && <div className="toast" role="status"><Check size={15}/>{toast}</div>}
-    {modal?.type === "create" || modal?.type === "link" || modal?.type === "push" ? <RepoActionModal modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal} onSubmit={(payload) => void action(modal.project, modal.type === "create" ? "create-repo" : modal.type === "link" ? "link" : "push", payload)}/> : null}
+    {modal?.type === "create" || modal?.type === "link" || modal?.type === "pull" || modal?.type === "push" ? <RepoActionModal modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal} onSubmit={(payload) => void action(modal.project, modal.type === "create" ? "create-repo" : modal.type === "link" ? "link" : modal.type === "pull" ? "pull" : "push", payload)}/> : null}
     {modal?.type === "preference" && <PreferenceDialog
       modal={modal} busy={busyProject === modal.project.canonicalPath} error={actionError} onClose={closeModal}
       onConfirm={() => void action(modal.project, "preferences", { [modal.kind]: !modal.project.preferences[modal.kind] })}
